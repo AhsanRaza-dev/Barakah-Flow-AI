@@ -1,0 +1,5 @@
+.env
+venv
+__pycache__
+barakah_vector_db
+data
