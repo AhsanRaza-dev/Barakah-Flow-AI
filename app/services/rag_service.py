@@ -50,10 +50,11 @@ class RAGService:
     async def _query_core(self, query):
         return await asyncio.to_thread(self.core_collection.query, query_texts=[query], n_results=3)
         
-    async def _query_fatawa(self, query):
-        return await asyncio.to_thread(self.fatawa_collection.query, query_texts=[query], n_results=2)
+    async def _query_fatawa(self, query, scholar=None):
+        where_clause = {"scholar": scholar} if scholar else None
+        return await asyncio.to_thread(self.fatawa_collection.query, query_texts=[query], n_results=2, where=where_clause)
 
-    async def ask_barakah_ai_stream(self, user_query: str):
+    async def ask_barakah_ai_stream(self, user_query: str, scholar: str = None):
         start_time = time.time()
         print(f"\n[STREAM] User Question: '{user_query}'")
 
@@ -92,7 +93,7 @@ class RAGService:
 
         # 2. Parallel Search DB
         core_future = self._query_core(translated_query)
-        fatawa_future = self._query_fatawa(translated_query)
+        fatawa_future = self._query_fatawa(translated_query, scholar)
         
         core_results, fatawa_results = await asyncio.gather(core_future, fatawa_future)
         
@@ -178,3 +179,68 @@ class RAGService:
         end_time = time.time()
         print(f"✅ Fast RAG generation complete in {round(end_time - start_time, 2)} seconds!")
         yield f"data: [DONE]\n\n"
+
+    def get_source(self, document_id: str):
+        if self.core_collection:
+            core_res = self.core_collection.get(ids=[document_id])
+            if core_res and 'documents' in core_res and core_res['documents']:
+                return {
+                    "id": core_res['ids'][0],
+                    "text": core_res['documents'][0],
+                    "metadata": core_res['metadatas'][0] if core_res['metadatas'] else {}
+                }
+        if self.fatawa_collection:
+            fatwa_res = self.fatawa_collection.get(ids=[document_id])
+            if fatwa_res and 'documents' in fatwa_res and fatwa_res['documents']:
+                return {
+                    "id": fatwa_res['ids'][0],
+                    "text": fatwa_res['documents'][0],
+                    "metadata": fatwa_res['metadatas'][0] if fatwa_res['metadatas'] else {}
+                }
+        return None
+
+    async def search_pure(self, query: str):
+        core_future = self._query_core(query)
+        fatawa_future = self._query_fatawa(query)
+        core_results, fatawa_results = await asyncio.gather(core_future, fatawa_future)
+        
+        chunks = []
+        if core_results and 'documents' in core_results and len(core_results['documents'][0]) > 0:
+            for i, doc in enumerate(core_results['documents'][0]):
+                meta = core_results['metadatas'][0][i] if 'metadatas' in core_results and core_results['metadatas'] else {}
+                chunks.append({"id": core_results['ids'][0][i], "text": doc, "metadata": meta})
+                
+        if fatawa_results and 'documents' in fatawa_results and len(fatawa_results['documents'][0]) > 0:
+            for i, doc in enumerate(fatawa_results['documents'][0]):
+                meta = fatawa_results['metadatas'][0][i] if 'metadatas' in fatawa_results and fatawa_results['metadatas'] else {}
+                chunks.append({"id": fatawa_results['ids'][0][i], "text": doc, "metadata": meta})
+                
+        return chunks
+
+    async def get_daily_wisdom(self):
+        import random
+        topics = ["patience", "prayer", "faith", "charity", "forgiveness", "mercy", "hereafter", "parents"]
+        query = random.choice(topics)
+        
+        try:
+            embedding = await asyncio.to_thread(self.openai_ef, [query])
+            core_fut = asyncio.to_thread(self.core_collection.query, query_embeddings=embedding, n_results=2)
+            fatwa_fut = asyncio.to_thread(self.fatawa_collection.query, query_embeddings=embedding, n_results=1)
+        except Exception as e:
+            core_fut = asyncio.to_thread(self.core_collection.query, query_texts=[query], n_results=2)
+            fatwa_fut = asyncio.to_thread(self.fatawa_collection.query, query_texts=[query], n_results=1)
+            
+        core_res, fatawa_res = await asyncio.gather(core_fut, fatwa_fut)
+        
+        wisdom = []
+        if core_res and 'documents' in core_res and len(core_res['documents'][0]) > 0:
+            for i, doc in enumerate(core_res['documents'][0]):
+                meta = core_res['metadatas'][0][i] if 'metadatas' in core_res and core_res['metadatas'] else {}
+                wisdom.append({"id": core_res['ids'][0][i], "text": doc, "metadata": meta})
+                    
+        if fatawa_res and 'documents' in fatawa_res and len(fatawa_res['documents'][0]) > 0:
+            for i, doc in enumerate(fatawa_res['documents'][0]):
+                meta = fatawa_res['metadatas'][0][i] if 'metadatas' in fatawa_res and fatawa_res['metadatas'] else {}
+                wisdom.append({"id": fatawa_res['ids'][0][i], "text": doc, "metadata": meta})
+                    
+        return wisdom
