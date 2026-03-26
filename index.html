@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Barakah Flow AI - Tester</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -45,21 +48,17 @@
         .ai-msg {
             background-color: #f5f5f5;
             border-left: 4px solid #4caf50;
-            white-space: pre-wrap; /* Preserves the markdown spacing nicely */
+            /* 🟢 white-space pre-wrap hata diya taake Markdown theek se render ho */
         }
-        .citation-box {
-            margin-top: 1rem;
-            background: #fff;
-            border: 1px solid #ddd;
-            padding: 0.8rem;
-            font-size: 0.9em;
-            border-radius: 6px;
-        }
-        .citation-title {
-            font-weight: bold;
-            color: #666;
-            margin-bottom: 0.5rem;
-        }
+        
+        /* 🟢 Nayi CSS taake AI ka Markdown khoobsurat lagay */
+        .ai-msg h3 { margin-top: 0; color: #2e7d32; }
+        .ai-msg p { margin-top: 5px; margin-bottom: 10px; }
+        .ai-msg ul, .ai-msg ol { padding-left: 20px; margin-bottom: 10px; }
+        .ai-msg code { background: #e0e0e0; padding: 2px 5px; border-radius: 4px; color: #d32f2f; font-family: monospace; }
+        .ai-msg pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 8px; overflow-x: auto; font-family: monospace; }
+        .ai-msg pre code { background: transparent; color: inherit; padding: 0; }
+
         .input-group {
             display: flex;
             gap: 10px;
@@ -94,20 +93,47 @@
             background-color: #cccccc;
             cursor: not-allowed;
         }
+        select {
+            padding: 10px; 
+            border-radius: 8px; 
+            border: 2px solid #e0e0e0; 
+            font-size: 14px;
+            background-color: white;
+            cursor: pointer;
+        }
+        select:focus {
+            outline: none;
+            border-color: #2196f3;
+        }
     </style>
 </head>
 <body>
 
     <h1>🕌 Barakah AI Tester</h1>
-    <div style="text-align: center; margin-bottom: 2rem;">
-        <label for="tokenInput" style="font-weight: bold; color: #555;">Auth Token: </label>
-        <input type="text" id="tokenInput" value="barakah-secure-token-123" placeholder="Enter Bearer Token..." style="width: 250px; padding: 10px; border-radius: 8px; border: 2px solid #e0e0e0; font-size: 14px; margin-left: 10px;">
+    
+    <div style="text-align: center; margin-bottom: 2rem; display: flex; justify-content: center; gap: 15px; align-items: center; flex-wrap: wrap;">
+        
+        <div>
+            <label for="tokenInput" style="font-weight: bold; color: #555;">Auth Token: </label>
+            <input type="text" id="tokenInput" value="barakah_flutter_secret_2026" placeholder="Bearer Token..." style="width: 220px; padding: 10px; border-radius: 8px; border: 2px solid #e0e0e0; font-size: 14px;">
+        </div>
+
+        <div>
+            <label for="madhabSelect" style="font-weight: bold; color: #555;">Fiqh / Madhab: </label>
+            <select id="madhabSelect">
+                <option value="Hanafi" selected>Hanafi (حنفي)</option>
+                <option value="Shafi">Shafi'i (شافعي)</option>
+                <option value="Maliki">Maliki (مالكي)</option>
+                <option value="Hanbali">Hanbali (حنبلي)</option>
+                <option value="Any">Any (General RAG)</option>
+            </select>
+        </div>
+
     </div>
 
     <div class="chat-container">
         <div class="messages" id="messages">
-            <!-- Messages will appear here -->
-        </div>
+            </div>
 
         <div class="input-group">
             <input type="text" id="queryInput" placeholder="Ask your Islamic question..." onkeypress="handleEnter(event)">
@@ -116,7 +142,7 @@
     </div>
 
     <script>
-        const API_URL = "/api/ask";
+        const API_URL = "http://127.0.0.1:8000/api/ask";
 
         function handleEnter(e) {
             if(e.key === 'Enter') askQuestion();
@@ -125,8 +151,12 @@
         async function askQuestion() {
             const input = document.getElementById('queryInput');
             const tokenInput = document.getElementById('tokenInput');
+            const madhabSelect = document.getElementById('madhabSelect'); 
+            
             const query = input.value.trim();
-            const TOKEN = tokenInput.value.trim() || "barakah-secure-token-123";
+            const TOKEN = tokenInput.value.trim() || "barakah_flutter_secret_2026";
+            const selectedMadhab = madhabSelect.value; 
+
             const btn = document.getElementById('sendBtn');
             const messages = document.getElementById('messages');
 
@@ -145,72 +175,49 @@
             
             const aiDiv = document.createElement('div');
             aiDiv.className = 'message ai-msg';
-            aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Consulting evidences...</em>`;
+            aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Searching ${selectedMadhab !== 'Any' ? selectedMadhab : 'all'} evidences...</em>`;
             messages.appendChild(aiDiv);
             messages.scrollTo(0, messages.scrollHeight);
 
             try {
-                // 3. Make Streaming API Call to FastAPI
+                // 3. Make Standard JSON API Call
                 const response = await fetch(API_URL, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${TOKEN}`
                     },
-                    body: JSON.stringify({ query: query })
+                    body: JSON.stringify({ 
+                        query: query,
+                        language: "roman_urdu",
+                        madhab: selectedMadhab 
+                    })
                 });
 
                 if (!response.ok) {
-                    throw new Error(`Server returned ${response.status}: ${await response.text()}`);
+                    throw new Error(`Server Error: ${response.status}`);
                 }
 
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder('utf-8');
-                let answerText = "";
-                let citationsHtml = "";
-                let buffer = "";
+                // 4. JSON Response Read
+                const data = await response.json();
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
+                if (data.status === "success") {
+                    // 🟢 THE FIX: Use marked.parse to convert Markdown to HTML
+                    const formattedAnswer = marked.parse(data.answer);
                     
-                    buffer += decoder.decode(value, {stream: true});
-                    let parts = buffer.split('\n\n');
-                    buffer = parts.pop(); // keep incomplete chunk
-                    
-                    for (const part of parts) {
-                        if (part.startsWith('data: ')) {
-                            const dataStr = part.substring(6);
-                            if (dataStr === '[DONE]') break;
-                            
-                            try {
-                                const data = JSON.parse(dataStr);
-                                if (data.status) {
-                                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>${data.status}</em>`;
-                                } else if (data.chunk) {
-                                    answerText += data.chunk;
-                                    // Make sure double new lines become paragraphs or breaks
-                                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br>${answerText.replace(/\n/g, '<br>')}`;
-                                } else if (data.citations && data.citations.length > 0) {
-                                    citationsHtml += `<div class="citation-box"><div class="citation-title">📚 Sources Considered:</div><ul>`;
-                                    data.citations.forEach(cit => {
-                                        citationsHtml += `<li><strong>[${cit.source_type.toUpperCase()}]</strong> ${cit.display_text}</li>`;
-                                    });
-                                    citationsHtml += `</ul></div>`;
-                                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br>${answerText.replace(/\n/g, '<br>')}${citationsHtml}`;
-                                } else if (data.error) {
-                                    throw new Error(data.error);
-                                }
-                            } catch (e) {
-                                // Just a parse catch for weird chunks
-                            }
-                        }
+                    let madhabBadge = "";
+                    if (data.madhab_applied && data.madhab_applied !== "Any") {
+                         madhabBadge = `<div style="margin-top: 15px;"><small style="color: #2196f3; border: 1px solid #2196f3; padding: 4px 8px; border-radius: 4px; background: #e3f2fd;"><strong>🔍 Filter Applied: ${data.madhab_applied} Fiqh</strong></small></div>`;
                     }
-                    messages.scrollTo(0, messages.scrollHeight);
+
+                    // 🟢 Set HTML safely
+                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><div style="margin-top: 10px;">${formattedAnswer}</div>${madhabBadge}`;
+                } else {
+                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Kuch galat ho gaya.</em>`;
                 }
 
             } catch (error) {
-                aiDiv.innerHTML = `<strong>Error:</strong><br><span style="color: red;">${error.message}</span>`;
+                aiDiv.innerHTML = `<strong>Error:</strong><br><span style="color: red;">${error.message} - Make sure your FastAPI server is running!</span>`;
             } finally {
                 btn.disabled = false;
                 btn.innerText = 'Ask';
