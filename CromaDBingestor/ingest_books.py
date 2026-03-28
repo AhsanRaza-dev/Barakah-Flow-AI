@@ -1,11 +1,12 @@
 import os
 import json
 import time
-import chromadb
-import chromadb.utils.embedding_functions as embedding_functions
+import psycopg2
+from psycopg2.extras import execute_values
+from openai import OpenAI
 from dotenv import load_dotenv
 
-print("🚀 Starting Smart Auto-Chunking Ingestion Pipeline...")
+print("🚀 Starting STRICT Auto-Chunking Ingestion Pipeline for pgvector...")
 
 # 1. Setup API Key
 load_dotenv()
@@ -14,23 +15,35 @@ openai_key = os.getenv("OPENAI_API_KEY")
 if not openai_key:
     raise ValueError("❌ OPENAI_API_KEY is missing!")
 
-# 2. Connect to ChromaDB
-print("🔌 Connecting to Vector Database...")
-openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=openai_key, model_name="text-embedding-3-large"
-)
-chroma_client = chromadb.PersistentClient(path="./barakah_vector_db")
+# Initialize OpenAI Client
+openai_client = OpenAI(api_key=openai_key)
 
-books_collection = chroma_client.get_or_create_collection(
-    name="classical_books_collection",
-    embedding_function=openai_ef
-)
+# 2. Connect to PostgreSQL (Docker on port 5433)
+print("🐘 Connecting to PostgreSQL Database...")
+try:
+    conn = psycopg2.connect(
+        dbname="barakah_db",
+        user="postgres",
+        password="barakah_secret_2026",
+        host="localhost",
+        port="5433" # 🟢 Conflict bachane wala naya port
+    )
+    cursor = conn.cursor()
+except Exception as e:
+    print(f"❌ Database Connection Error: {e}")
+    print("⚠️ Hint: Ensure Docker container is running on port 5433.")
+    exit()
 
-# 🟢 THE MONEY SAVER
+# 🟢 STRICT RULE 1: Ultra-Safe Memory Fetching (Checking Existing IDs)
 print("🔍 Checking existing records to avoid double-billing...")
-existing_data = books_collection.get(include=[]) 
-existing_ids = set(existing_data['ids'])
-print(f"✅ Found {len(existing_ids)} records already safe in DB. These will be SKIPPED!")
+try:
+    cursor.execute("SELECT source_id FROM knowledge_base;")
+    existing_ids = {row[0] for row in cursor.fetchall()}
+    print(f"✅ Found {len(existing_ids)} records already safe in DB. These will be SKIPPED!")
+except Exception as e:
+    print(f"❌ DB Read Error: {e}")
+    print("⚠️ Hint: Kya database ki table ban chuki hai?")
+    exit()
 
 # 3. Data Load & Process Function
 def ingest_fiqh_books(base_folder_path):
@@ -68,8 +81,8 @@ def ingest_fiqh_books(base_folder_path):
                                 "chapter": str(item.get("chapter", ""))
                             }
                             
-                            # 🟢 THE FIX: Lowered MAX_CHARS to 6000 for Arabic safety
-                            MAX_CHARS = 6000 
+                            # 🟢 STRICT RULE 2: Max Characters locked to 5000 (Very Safe for Arabic)
+                            MAX_CHARS = 5000 
                             
                             if len(text) > MAX_CHARS:
                                 chunks = [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
@@ -100,24 +113,63 @@ def ingest_fiqh_books(base_folder_path):
 
     print(f"📊 Found {total_chunks} NEW Arabic text chunks. Starting vectorization...")
 
-    # 4. Batch Ingestion
-    BATCH_SIZE = 100
+    # 🟢 STRICT RULE 3: Micro-Batching
+    BATCH_SIZE = 50 
+    
     for i in range(0, total_chunks, BATCH_SIZE):
         batch_ids = ids[i : i + BATCH_SIZE]
         batch_docs = documents[i : i + BATCH_SIZE]
         batch_meta = metadatas[i : i + BATCH_SIZE]
         
-        try:
-            books_collection.upsert(
-                documents=batch_docs,
-                metadatas=batch_meta,
-                ids=batch_ids
-            )
-            print(f"   ✅ Ingested {min(i + BATCH_SIZE, total_chunks)} / {total_chunks} NEW records...")
-            time.sleep(1.5) 
-        except Exception as e:
-            print(f"❌ Error inserting batch: {e}")
-            break 
+        # 🟢 STRICT RULE 4: Auto-Retry Logic (3 attempts)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 1. Fetch Embeddings direct from OpenAI
+                response = openai_client.embeddings.create(
+                    input=batch_docs,
+                    model="text-embedding-3-large"
+                )
+                embeddings = [item.embedding for item in response.data]
+                
+                # 2. Format Data for PostgreSQL
+                records_to_insert = []
+                for j in range(len(batch_ids)):
+                    meta = batch_meta[j]
+                    records_to_insert.append((
+                        batch_ids[j],                  # source_id
+                        meta.get("type"),              # source_type
+                        meta.get("madhab"),            # fiqh
+                        batch_docs[j],                 # text
+                        json.dumps(meta),              # metadata JSON
+                        None,                          # authority
+                        embeddings[j]                  # embedding vector
+                    ))
+                
+                # 3. Insert into pgvector securely
+                insert_query = """
+                INSERT INTO knowledge_base (source_id, source_type, fiqh, text, metadata, authority, embedding)
+                VALUES %s
+                ON CONFLICT (source_id) DO NOTHING;
+                """
+                execute_values(cursor, insert_query, records_to_insert)
+                conn.commit()
+                
+                print(f"   ✅ Ingested {min(i + BATCH_SIZE, total_chunks)} / {total_chunks} NEW records into pgvector...")
+                
+                # 🟢 STRICT RULE 5: API Cooldown (2 Seconds breather)
+                time.sleep(2.0) 
+                break # Success ho gaya to retry loop tod do
+                
+            except Exception as e:
+                print(f"⚠️ Batch Insert Error on attempt {attempt+1}/{max_retries}: {e}")
+                conn.rollback() # Error ke case mein transaction wapis le lein
+                if attempt < max_retries - 1:
+                    print("🔄 Retrying in 5 seconds...")
+                    time.sleep(5) 
+                else:
+                    print("❌ Fatal Error: OpenAI or DB issue. Stopping script safely to prevent corruption.")
+                    return
 
 # Folder path
 BOOKS_FOLDER_PATH = "./Fiqa Books" 
@@ -125,4 +177,6 @@ BOOKS_FOLDER_PATH = "./Fiqa Books"
 # Script run
 ingest_fiqh_books(BOOKS_FOLDER_PATH)
 
-print("\n🎉 Alhamdulilah! Process Completed!")
+print("\n🎉 Alhamdulilah! STRICT pgvector Process Completed Safely!")
+cursor.close()
+conn.close()
