@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Barakah Flow AI - Tester</title>
+    <title>Barakah Flow AI - Enterprise Tester</title>
     
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
@@ -48,10 +48,9 @@
         .ai-msg {
             background-color: #f5f5f5;
             border-left: 4px solid #4caf50;
-            /* 🟢 white-space pre-wrap hata diya taake Markdown theek se render ho */
         }
         
-        /* 🟢 Nayi CSS taake AI ka Markdown khoobsurat lagay */
+        /* 🟢 Markdown Styling */
         .ai-msg h3 { margin-top: 0; color: #2e7d32; }
         .ai-msg p { margin-top: 5px; margin-bottom: 10px; }
         .ai-msg ul, .ai-msg ol { padding-left: 20px; margin-bottom: 10px; }
@@ -105,11 +104,22 @@
             outline: none;
             border-color: #2196f3;
         }
+        .cache-badge {
+            background-color: #ffeb3b;
+            color: #d84315;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            display: inline-block;
+            margin-bottom: 8px;
+            border: 1px solid #fbc02d;
+        }
     </style>
 </head>
 <body>
 
-    <h1>🕌 Barakah AI Tester</h1>
+    <h1>🕌 Barakah AI Enterprise Tester</h1>
     
     <div style="text-align: center; margin-bottom: 2rem; display: flex; justify-content: center; gap: 15px; align-items: center; flex-wrap: wrap;">
         
@@ -125,6 +135,7 @@
                 <option value="Shafi">Shafi'i (شافعي)</option>
                 <option value="Maliki">Maliki (مالكي)</option>
                 <option value="Hanbali">Hanbali (حنبلي)</option>
+                <option value="Ahle Hadith">Ahle Hadith (أهل الحديث)</option>
                 <option value="Any">Any (General RAG)</option>
             </select>
         </div>
@@ -143,6 +154,10 @@
 
     <script>
         const API_URL = "http://127.0.0.1:8000/api/ask";
+        
+        // 🟢 ENTERPRISE FEATURE: Generate a Session ID for this browser tab
+        const currentSessionId = "browser_test_" + Math.floor(Math.random() * 1000000);
+        console.log("Current Session ID:", currentSessionId);
 
         function handleEnter(e) {
             if(e.key === 'Enter') askQuestion();
@@ -180,7 +195,7 @@
             messages.scrollTo(0, messages.scrollHeight);
 
             try {
-                // 3. Make Standard JSON API Call
+                // 3. Make Enterprise JSON API Call
                 const response = await fetch(API_URL, {
                     method: 'POST',
                     headers: {
@@ -190,34 +205,46 @@
                     body: JSON.stringify({ 
                         query: query,
                         language: "roman_urdu",
-                        madhab: selectedMadhab 
+                        madhab: selectedMadhab,
+                        // 🟢 Naye Data Fields
+                        session_id: currentSessionId,
+                        user_id: "anonymous"
                     })
                 });
 
+                // 🟢 ENTERPRISE ERROR HANDLING (Rate limits etc.)
                 if (!response.ok) {
-                    throw new Error(`Server Error: ${response.status}`);
+                    const errData = await response.json().catch(() => null);
+                    const errMsg = errData && errData.detail ? errData.detail : `Server Error: ${response.status}`;
+                    throw new Error(errMsg);
                 }
 
                 // 4. JSON Response Read
                 const data = await response.json();
 
                 if (data.status === "success") {
-                    // 🟢 THE FIX: Use marked.parse to convert Markdown to HTML
                     const formattedAnswer = marked.parse(data.answer);
                     
+                    // 🟢 CACHE BADGE UI
+                    let cacheIndicator = "";
+                    if (data.source === "cache") {
+                        cacheIndicator = `<div class="cache-badge">⚡ CACHE HIT (0.1s) - $0 Cost</div><br>`;
+                    }
+
                     let madhabBadge = "";
                     if (data.madhab_applied && data.madhab_applied !== "Any") {
                          madhabBadge = `<div style="margin-top: 15px;"><small style="color: #2196f3; border: 1px solid #2196f3; padding: 4px 8px; border-radius: 4px; background: #e3f2fd;"><strong>🔍 Filter Applied: ${data.madhab_applied} Fiqh</strong></small></div>`;
                     }
 
-                    // 🟢 Set HTML safely
-                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><div style="margin-top: 10px;">${formattedAnswer}</div>${madhabBadge}`;
+                    // Set HTML safely with all new features
+                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br>${cacheIndicator}<div style="margin-top: 10px;">${formattedAnswer}</div>${madhabBadge}`;
                 } else {
                     aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Kuch galat ho gaya.</em>`;
                 }
 
             } catch (error) {
-                aiDiv.innerHTML = `<strong>Error:</strong><br><span style="color: red;">${error.message} - Make sure your FastAPI server is running!</span>`;
+                // Show errors gracefully (like 403 Rate Limit)
+                aiDiv.innerHTML = `<strong>System Alert:</strong><br><span style="color: #d32f2f; font-weight: bold;">${error.message}</span>`;
             } finally {
                 btn.disabled = false;
                 btn.innerText = 'Ask';
