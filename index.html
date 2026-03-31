@@ -57,6 +57,11 @@
         .ai-msg code { background: #e0e0e0; padding: 2px 5px; border-radius: 4px; color: #d32f2f; font-family: monospace; }
         .ai-msg pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 8px; overflow-x: auto; font-family: monospace; }
         .ai-msg pre code { background: transparent; color: inherit; padding: 0; }
+        
+        /* Table Styling */
+        table { border-collapse: collapse; width: 100%; margin-bottom: 15px; font-size: 14px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #4caf50; color: white; }
 
         .input-group {
             display: flex;
@@ -104,17 +109,6 @@
             outline: none;
             border-color: #2196f3;
         }
-        .cache-badge {
-            background-color: #ffeb3b;
-            color: #d84315;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
-            display: inline-block;
-            margin-bottom: 8px;
-            border: 1px solid #fbc02d;
-        }
     </style>
 </head>
 <body>
@@ -144,7 +138,7 @@
 
     <div class="chat-container">
         <div class="messages" id="messages">
-            </div>
+        </div>
 
         <div class="input-group">
             <input type="text" id="queryInput" placeholder="Ask your Islamic question..." onkeypress="handleEnter(event)">
@@ -155,7 +149,7 @@
     <script>
         const API_URL = "http://127.0.0.1:8000/api/ask";
         
-        // 🟢 ENTERPRISE FEATURE: Generate a Session ID for this browser tab
+        // Generate a Session ID for this browser tab
         const currentSessionId = "browser_test_" + Math.floor(Math.random() * 1000000);
         console.log("Current Session ID:", currentSessionId);
 
@@ -190,12 +184,20 @@
             
             const aiDiv = document.createElement('div');
             aiDiv.className = 'message ai-msg';
-            aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Searching ${selectedMadhab !== 'Any' ? selectedMadhab : 'all'} evidences...</em>`;
+            
+            // Madhab filter badge preparation
+            let madhabBadge = "";
+            if (selectedMadhab && selectedMadhab !== "Any") {
+                 madhabBadge = `<div style="margin-top: 15px;"><small style="color: #2196f3; border: 1px solid #2196f3; padding: 4px 8px; border-radius: 4px; background: #e3f2fd;"><strong>🔍 Filter Applied: ${selectedMadhab} Fiqh</strong></small></div>`;
+            }
+            
+            aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><div class="content"><em>Searching database...</em></div>${madhabBadge}`;
             messages.appendChild(aiDiv);
+            const contentDiv = aiDiv.querySelector('.content');
             messages.scrollTo(0, messages.scrollHeight);
 
             try {
-                // 3. Make Enterprise JSON API Call
+                // 3. Make API Call for Stream
                 const response = await fetch(API_URL, {
                     method: 'POST',
                     headers: {
@@ -206,45 +208,58 @@
                         query: query,
                         language: "roman_urdu",
                         madhab: selectedMadhab,
-                        // 🟢 Naye Data Fields
                         session_id: currentSessionId,
                         user_id: "anonymous"
                     })
                 });
 
-                // 🟢 ENTERPRISE ERROR HANDLING (Rate limits etc.)
+                // 🟢 Error Handling (Rate limits etc.)
                 if (!response.ok) {
                     const errData = await response.json().catch(() => null);
                     const errMsg = errData && errData.detail ? errData.detail : `Server Error: ${response.status}`;
                     throw new Error(errMsg);
                 }
 
-                // 4. JSON Response Read
-                const data = await response.json();
+                // 4. Stream Reader Logic (Typing Effect)
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+                let done = false;
+                let fullText = ""; // Sara text yahan jama hoga
 
-                if (data.status === "success") {
-                    const formattedAnswer = marked.parse(data.answer);
+                while (!done) {
+                    const { value, done: readerDone } = await reader.read();
+                    done = readerDone;
                     
-                    // 🟢 CACHE BADGE UI
-                    let cacheIndicator = "";
-                    if (data.source === "cache") {
-                        cacheIndicator = `<div class="cache-badge">⚡ CACHE HIT (0.1s) - $0 Cost</div><br>`;
+                    if (value) {
+                        const chunk = decoder.decode(value, { stream: true });
+                        const lines = chunk.split('\n');
+                        
+                        for (let line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const textChunk = line.substring(6);
+                                
+                                if (textChunk === '[DONE]') {
+                                    break;
+                                } else if (textChunk.startsWith('[ERROR]')) {
+                                    contentDiv.innerHTML += `<br><span style="color:red;">${textChunk}</span>`;
+                                    break;
+                                } else {
+                                    // Replace literal '\n' sent from server to real new lines
+                                    const cleanChunk = textChunk.replace(/\\n/g, '\n');
+                                    fullText += cleanChunk;
+                                    
+                                    // Parse Markdown live
+                                    contentDiv.innerHTML = marked.parse(fullText);
+                                    messages.scrollTo(0, messages.scrollHeight);
+                                }
+                            }
+                        }
                     }
-
-                    let madhabBadge = "";
-                    if (data.madhab_applied && data.madhab_applied !== "Any") {
-                         madhabBadge = `<div style="margin-top: 15px;"><small style="color: #2196f3; border: 1px solid #2196f3; padding: 4px 8px; border-radius: 4px; background: #e3f2fd;"><strong>🔍 Filter Applied: ${data.madhab_applied} Fiqh</strong></small></div>`;
-                    }
-
-                    // Set HTML safely with all new features
-                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br>${cacheIndicator}<div style="margin-top: 10px;">${formattedAnswer}</div>${madhabBadge}`;
-                } else {
-                    aiDiv.innerHTML = `<strong>Barakah AI:</strong><br><em>Kuch galat ho gaya.</em>`;
                 }
 
             } catch (error) {
-                // Show errors gracefully (like 403 Rate Limit)
-                aiDiv.innerHTML = `<strong>System Alert:</strong><br><span style="color: #d32f2f; font-weight: bold;">${error.message}</span>`;
+                // Show errors gracefully
+                contentDiv.innerHTML = `<span style="color: #d32f2f; font-weight: bold;">System Alert: ${error.message}</span>`;
             } finally {
                 btn.disabled = false;
                 btn.innerText = 'Ask';
