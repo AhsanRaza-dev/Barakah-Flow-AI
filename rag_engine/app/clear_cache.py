@@ -1,4 +1,7 @@
+import os
 import psycopg2
+from dotenv import load_dotenv
+load_dotenv()
 
 print("🧹 Clearing the Semantic Cache...")
 conn = None
@@ -6,9 +9,9 @@ try:
     conn = psycopg2.connect(
         dbname="barakah_db",
         user="postgres",
-        password="barakah_secret_2026",
+        password=os.getenv("DB_PASSWORD", "barakah_secret_2026"),
         host="localhost",
-        port="5433" # Aapka Docker port
+        port="5433"
     )
     cursor = conn.cursor()
     
