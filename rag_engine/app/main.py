@@ -1,19 +1,25 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Response, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import os
 import time
 import jwt as pyjwt
 import psycopg2
 import psycopg2.pool
 from pgvector.psycopg2 import register_vector
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from supabase import create_client, Client
 from openai import OpenAI
 from google import genai
 from dotenv import load_dotenv
+
+log = logging.getLogger("barakah.api")
 
 # ==========================================
 # 1. SETUP & KEYS
@@ -83,27 +89,41 @@ if conn:
 # ==========================================
 app = FastAPI(title="Barakah AI API", version="4.0 - JWT Edition")
 
-_allowed_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+# Rate limiter (slowapi) — keyed by client IP. Fitrah/RAG AI endpoints apply
+# explicit @limiter.limit() decorators. Default 120/min is a soft cap for the rest.
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS — default to localhost only. Production MUST set ALLOWED_ORIGINS explicitly.
+_cors_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _cors_env:
+    _allowed_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _allowed_origins = ["http://localhost", "http://localhost:3000", "http://127.0.0.1"]
+    log.warning("ALLOWED_ORIGINS env not set — defaulting to localhost. Set this in production.")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=_allowed_origins != ["*"],  # credentials only when origins are explicit
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
 security = HTTPBearer()
 
-# ── JWT Auth (replaces static token) ─────────────────────────────────────────
-# Validates the Supabase JWT sent by the Flutter app.
-# Decodes: sub (user_id), role ("anon" | "authenticated"), is_anonymous (bool).
-# Falls back to static token during local dev when SUPABASE_JWT_SECRET is unset.
+# Static dev token — only honoured when BOTH (a) SUPABASE_JWT_SECRET is unset
+# (i.e. we're in dev) AND (b) API_BEARER_TOKEN is explicitly set. No hardcoded
+# default: production with JWT configured never accepts a static token.
+_DEV_STATIC_TOKEN = os.getenv("API_BEARER_TOKEN") if not jwt_secret else None
+if _DEV_STATIC_TOKEN:
+    log.warning("SUPABASE_JWT_SECRET unset — static API_BEARER_TOKEN fallback is active (dev mode).")
+
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
 
-    # Try Supabase JWT verification first (when secret is configured)
     if jwt_secret:
         try:
             payload = pyjwt.decode(
@@ -114,16 +134,15 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             )
             return payload
         except pyjwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="❌ Token expired. Please sign in again.")
+            raise HTTPException(status_code=401, detail="Token expired. Please sign in again.")
         except pyjwt.InvalidTokenError:
-            pass  # fall through to static token check
+            raise HTTPException(status_code=401, detail="Invalid or missing token.")
 
-    # Static dev/API token fallback — always checked regardless of jwt_secret
-    api_token = os.getenv("API_BEARER_TOKEN", "barakah_flutter_secret_2026")
-    if token == api_token:
+    # Dev-mode fallback — only when JWT secret is unset and operator has set API_BEARER_TOKEN
+    if _DEV_STATIC_TOKEN and token == _DEV_STATIC_TOKEN:
         return {"sub": "anonymous", "role": "anon", "is_anonymous": True}
 
-    raise HTTPException(status_code=401, detail="❌ Invalid or missing token.")
+    raise HTTPException(status_code=401, detail="Invalid or missing token.")
 
 # ==========================================
 # 4. DATA MODELS
@@ -227,11 +246,12 @@ def serve_ui():
     return FileResponse("index.html")
 
 @app.post("/api/ask")
-def ask_barakah_ai(request: AskRequest, jwt_payload: dict = Depends(verify_token)):
-    user_query      = request.safe_query
+@limiter.limit("30/minute")
+def ask_barakah_ai(request: Request, ask: AskRequest, jwt_payload: dict = Depends(verify_token)):
+    user_query      = ask.safe_query
     if not user_query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    selected_madhab = request.madhab
+    selected_madhab = ask.madhab
 
     # Extract real user identity from JWT (overrides request body)
     user_id      = jwt_payload.get("sub", "anonymous")
@@ -285,7 +305,7 @@ def ask_barakah_ai(request: AskRequest, jwt_payload: dict = Depends(verify_token
             try:
                 res = supabase.table("conversation_history") \
                     .select("query, response") \
-                    .eq("session_id", request.session_id) \
+                    .eq("session_id", ask.session_id) \
                     .order("created_at", desc=True) \
                     .limit(2) \
                     .execute()
@@ -390,7 +410,7 @@ def ask_barakah_ai(request: AskRequest, jwt_payload: dict = Depends(verify_token
         )
 
         system_prompt = f"""You are Barakah AI, an elite Islamic Fiqh assistant.
-Language: {request.language}
+Language: {ask.language}
 {chat_history}
 {comparator_logic}
 
@@ -442,8 +462,15 @@ USER QUESTION: {search_query_roman}"""
             # Supabase conversation + usage (background — does NOT block response)
             # Skip saving history if user has anonymous mode enabled
             save_to_supabase_bg(
-                user_id, request.session_id, user_query, full_answer,
-                save_history=request.save_history
+                user_id, ask.session_id, user_query, full_answer,
+                save_history=ask.save_history
             )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ── Fitrah Engine routes ──────────────────────────────────────────────────────
+import sys, os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "..", ".."))
+from fitrah_engine.fitrah_routes import router as fitrah_router
+app.include_router(fitrah_router, prefix="/api/fitrah")

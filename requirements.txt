@@ -11,3 +11,6 @@ PyJWT>=2.8.0
 psycopg2-binary>=2.9.9
 pgvector>=0.2.5
 supabase>=2.4.0
+# ── Fitrah AI additions ───────────────────────────────────────────────────────
+anthropic>=0.40.0
+APScheduler>=3.10.4
