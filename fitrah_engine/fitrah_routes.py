@@ -382,7 +382,7 @@ def _call_claude(system_prompt: str, user_prompt: str) -> str | None:
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=_MAQSAD_CFG.get("max_tokens", 1000),
             temperature=_MAQSAD_CFG.get("temperature", 0.7),
-            system=system_prompt,
+            system=_fitrah_system(system_prompt),
             messages=[{"role": "user", "content": user_prompt}],
         )
         return msg.content[0].text.strip()
@@ -396,6 +396,78 @@ def _fill_template(template: str, variables: dict) -> str:
     for key, value in variables.items():
         template = template.replace(f"{{{{{key}}}}}", str(value))
     return template
+
+
+# Review #12 + #13 — every AI response across Fitrah OS must follow the same
+# rules: empathy first, Islamically-grounded framing, at most ONE concrete
+# action, no lectures/guilt/ghayb claims, no points or gamification language.
+# Prepended to every system prompt via `_fitrah_system()`.
+FITRAH_GLOBAL_SYSTEM_PREFIX = (
+    "ROLE: You are part of Barakah AI (Fitrah OS) — a spiritual companion for "
+    "Muslim users. Follow these rules in EVERY response:\n"
+    "1. Validate feelings first. One short empathetic line before any guidance.\n"
+    "2. Islamic framing — Quran/Sunnah/Sahaba only when it adds light, never as proof-texting.\n"
+    "3. At most ONE small concrete action per response. No lists of chores.\n"
+    "4. Tone: narm, Urdu-first (unless user writes English), no lectures, no guilt.\n"
+    "5. Tentative language: 'shayad', 'ho sakta hai', 'Allah behtar jaanta hai'. "
+    "   NEVER claim to know ghayb or definitively judge the user's state with Allah.\n"
+    "6. No 'punishment', 'saza', 'azab', 'istidraj' wording. Use 'tanbeeh' (reminder) instead.\n"
+    "7. No points/scores/crystal/levels language in user-facing text.\n"
+    "8. If the user shows signs of crisis (self-harm, abuse, severe distress), "
+    "   point to trusted human help — a mufti, scholar, doctor, or local helpline — not app features.\n"
+    "--- END GLOBAL RULES ---\n\n"
+)
+
+
+def _fitrah_system(system_prompt: str | None) -> str:
+    """
+    Prepend the global Fitrah system prefix to a per-endpoint system prompt.
+    Safe to call with None/empty — returns the prefix alone in that case.
+    """
+    if not system_prompt:
+        return FITRAH_GLOBAL_SYSTEM_PREFIX.rstrip()
+    return FITRAH_GLOBAL_SYSTEM_PREFIX + system_prompt
+
+
+# Review #7 — soften any "punishment / warning / istidraj / saza / azab"
+# wording the LLM may still emit to a gentler "tanbeeh" framing. Users should
+# never feel the app is accusing them.
+_HARSH_LABEL_MAP = {
+    "punishment": "tanbeeh",
+    "warning":    "tanbeeh",
+    "istidraj":   "tanbeeh",
+    "saza":       "tanbeeh",
+    "azab":       "tanbeeh",
+    "sazā":       "tanbeeh",
+}
+_TANBEEH_NOTE_UR = (
+    "Yeh saza nahi — yeh Allah ki taraf se ek narm yaad-dehani samjhi ja sakti hai. "
+    "Rehnuma samjho, ilzam nahi."
+)
+
+
+def _soften_classification(result: dict) -> dict:
+    """Translate harsh classification labels to 'tanbeeh' + add reminder note."""
+    if not isinstance(result, dict):
+        return result
+    for key in ("classification", "primary_classification", "test_type"):
+        val = result.get(key)
+        if isinstance(val, str):
+            low = val.strip().lower()
+            if low in _HARSH_LABEL_MAP:
+                result[key] = _HARSH_LABEL_MAP[low]
+                result.setdefault("tanbeeh_note_ur", _TANBEEH_NOTE_UR)
+    ur = result.get("test_type_ur") or result.get("classification_ur")
+    if isinstance(ur, str):
+        for harsh, soft in _HARSH_LABEL_MAP.items():
+            if harsh in ur.lower():
+                if "test_type_ur" in result:
+                    result["test_type_ur"] = "Tanbeeh"
+                if "classification_ur" in result:
+                    result["classification_ur"] = "Tanbeeh"
+                result.setdefault("tanbeeh_note_ur", _TANBEEH_NOTE_UR)
+                break
+    return result
 
 
 def _smart_ayah(dimension: str, situation: str = "") -> dict | None:
@@ -435,6 +507,133 @@ def _is_crisis_situation(situation: str, qalb_state: str = "") -> bool:
         return False
     sit_lower = situation.lower()
     return any(kw in sit_lower for kw in _CRISIS_KEYWORDS)
+
+
+# Review #6 — three-tier severity classifier so responses match intensity.
+# light   = small friction, day-to-day slip
+# medium  = real struggle, needs steady action
+# severe  = heavy / sustained distress — nudge toward a trusted human alongside AI
+_SEVERE_KEYWORDS = frozenset([
+    "depression", "depressed", "panic", "panic attack", "cant sleep", "can't sleep",
+    "insomnia", "addicted", "addiction", "relapse", "abuse", "abused",
+    "trauma", "ptsd", "haar gaya", "haar gayi", "tut gaya", "tooT gaya",
+    "bikhar gaya", "bikhar gayi", "bardasht nahi", "zindagi bhari", "ghutan",
+    "roz rota", "roz roti", "nafrat khud se",
+])
+_MEDIUM_KEYWORDS = frozenset([
+    "chinta", "pareshan", "udaas", "stress", "anxiety", "anxious",
+    "guilty", "guilt", "gunah", "maghmoom", "bhaari",
+    "fight", "jhagra", "rishta", "taluq khatam", "miss", "lonely", "akela",
+    "akeli", "bore", "thaka", "thaki", "dar", "khauf",
+])
+
+
+def _classify_severity(text: str) -> str:
+    """
+    Return 'light' | 'medium' | 'severe'. Keyword-based, deterministic so it
+    doesn't cost another LLM round-trip. Crisis is already short-circuited
+    by check_crisis() before this runs.
+    """
+    if not text:
+        return "light"
+    low = text.lower()
+    if any(kw in low for kw in _SEVERE_KEYWORDS):
+        return "severe"
+    if any(kw in low for kw in _MEDIUM_KEYWORDS):
+        return "medium"
+    return "light"
+
+
+def _severity_nudge(severity: str) -> dict | None:
+    """Return a suggested companion action keyed to severity (UI can render as chip)."""
+    if severity == "severe":
+        return {
+            "message_ur": (
+                "Yeh bohat bhaari lag raha hai — akele mat uthayein. Ek bharose walay "
+                "insaan (ghar mein, dost, mufti, ya doctor) se baat karein. AI ek "
+                "saathi hai, lekin human support zaroori hai is waqt."
+            ),
+            "action_key": "reach_trusted_human",
+        }
+    if severity == "medium":
+        return {
+            "message_ur": "Rozana ek chhota qadam — istiqamat hi asli shifaa hai. Khud par narmi rakhen.",
+            "action_key": "steady_small_step",
+        }
+    return None
+
+
+# Review #2 + #9 — crystal score, points, and other numeric internals are hidden
+# from responses by default so the app reads as a spiritual companion, not a
+# gamified tracker. Surface them only when either (a) the user has explicitly
+# opted into detailed mode on their profile, or (b) the caller passes
+# ?detailed=true (for admin/debug UIs).
+_NUMERIC_KEYS_HIDDEN_BY_DEFAULT = frozenset([
+    "crystal_score", "crystal_score_start", "crystal_score_end",
+    "new_crystal_score", "delta_crystal", "delta_crystal_score",
+    "crystal_prev", "crystal_min", "crystal_max",
+    "points_awarded", "points_primary", "points_secondary",
+])
+
+
+def _user_has_detailed_view(user_id: str) -> bool:
+    """Read the stored detailed_view_enabled flag. Defaults to False on error."""
+    if not user_id or user_id == "anonymous":
+        return False
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT detailed_view_enabled FROM fitrah_users WHERE user_id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+    finally:
+        release_db_connection(conn)
+
+
+def _strip_numeric_if_hidden(resp: dict, user_id: str, detailed_override: bool) -> dict:
+    """
+    Drop gamification-ish numeric keys unless detailed mode is active.
+    `detailed_override` comes from ?detailed=true; user flag is the persistent toggle.
+    Non-destructive on non-dict inputs.
+    """
+    if not isinstance(resp, dict):
+        return resp
+    if detailed_override or _user_has_detailed_view(user_id):
+        return resp
+    return {k: v for k, v in resp.items() if k not in _NUMERIC_KEYS_HIDDEN_BY_DEFAULT}
+
+
+# Review #8 — fetch the user's saved trusted contact; returns None if none set
+# or if the columns haven't been provisioned yet. Safe to call from any handler.
+def _fetch_trusted_contact(user_id: str) -> dict | None:
+    if not user_id or user_id == "anonymous":
+        return None
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT trusted_contact_name, trusted_contact_number "
+                "FROM fitrah_users WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+        except Exception:
+            conn.rollback()
+            return None
+        if not row:
+            return None
+        name, number = row
+        if not name and not number:
+            return None
+        return {"name": name, "number": number}
+    finally:
+        release_db_connection(conn)
 
 
 def _crisis_ayah() -> dict | None:
@@ -544,7 +743,7 @@ def get_profiler_questions(_jwt_payload: dict = Depends(verify_token)):
 # ── 1. POST /log_action ───────────────────────────────────────────────────────
 
 @router.post("/log_action")
-def log_action(req: LogActionRequest, jwt_payload: dict = Depends(verify_token)):
+def log_action(req: LogActionRequest, detailed: bool = False, jwt_payload: dict = Depends(verify_token)):
     user_id = jwt_payload.get("sub") or req.user_id
     if not user_id or user_id == "anonymous":
         raise HTTPException(400, "Authenticated user_id required for Fitrah actions.")
@@ -611,13 +810,23 @@ def log_action(req: LogActionRequest, jwt_payload: dict = Depends(verify_token))
                     },
                 )
 
+        # Review #3 — growth slowdown: scale positive earnings while the slowdown
+        # window is active. Values below floor to 1 when original request was positive.
+        growth_mult = _fetch_growth_multiplier(cur, user_id)
+        def _scaled(n: int | float) -> int:
+            if n <= 0 or growth_mult >= 1.0:
+                return int(n)
+            return max(1, int(round(n * growth_mult)))
+        pts_primary_scaled   = _scaled(pts_primary)
+        pts_secondary_scaled = _scaled(pts_secondary) if pts_secondary else 0
+
         # Award primary dimension points (capped by daily_max_gain)
-        pts_primary_actual = _apply_points(cur, user_id, dim_primary, pts_primary)
+        pts_primary_actual = _apply_points(cur, user_id, dim_primary, pts_primary_scaled)
 
         # Award secondary dimension points if any (also capped)
         pts_secondary_actual = 0
         if dim_secondary and pts_secondary and dim_secondary in VALID_DIMENSIONS:
-            pts_secondary_actual = _apply_points(cur, user_id, dim_secondary, pts_secondary)
+            pts_secondary_actual = _apply_points(cur, user_id, dim_secondary, pts_secondary_scaled)
 
         # Read back updated scores
         dim_scores = _fetch_dim_scores(cur, user_id)
@@ -823,7 +1032,7 @@ def log_action(req: LogActionRequest, jwt_payload: dict = Depends(verify_token))
                 "confirm_endpoint":         "POST /api/fitrah/nafs/confirm-promotion",
             }
 
-        return {
+        _resp = {
             "success": True,
             "action_name": action["action_name"],
             "points_earned": {
@@ -856,6 +1065,7 @@ def log_action(req: LogActionRequest, jwt_payload: dict = Depends(verify_token))
             },
             "message": f"MashAllah! +{pts_primary} {dim_primary.upper()} — {action['action_name']}",
         }
+        return _strip_numeric_if_hidden(_resp, user_id, detailed)
 
     except HTTPException:
         conn.rollback()
@@ -1223,6 +1433,68 @@ class UserSettingsRequest(BaseModel):
     detailed_view_enabled: Optional[bool] = None
     tone_preference:       Optional[str]  = None  # urdu_english_mix | urdu_only | english_only
     quranic_mirror_muted:  Optional[bool] = None  # PDF §15 — user autonomy to mute mirror pushes
+    # Review #8 — trusted human contact surfaced in severe/crisis payloads.
+    # Stored plain so it's retrievable fast; user can clear by sending empty string.
+    trusted_contact_name:   Optional[str] = Field(None, max_length=100)
+    trusted_contact_number: Optional[str] = Field(None, max_length=30)
+
+
+# Review #8 — ensure the trusted_contact columns exist on first use of the
+# feature. Idempotent; runs at most once per process.
+_TRUSTED_SCHEMA_READY = False
+def _ensure_trusted_contact_schema(cur):
+    global _TRUSTED_SCHEMA_READY
+    if _TRUSTED_SCHEMA_READY:
+        return
+    cur.execute(
+        "ALTER TABLE fitrah_users "
+        "ADD COLUMN IF NOT EXISTS trusted_contact_name   TEXT, "
+        "ADD COLUMN IF NOT EXISTS trusted_contact_number TEXT"
+    )
+    _TRUSTED_SCHEMA_READY = True
+
+
+# Review #3 — growth-slowdown schema. Instead of subtracting points on a slip,
+# we slow future gains (multiplier < 1.0) for a bounded window so the slip
+# doesn't erase weeks of work but also doesn't vanish without consequence.
+_GROWTH_SLOWDOWN_SCHEMA_READY = False
+def _ensure_growth_slowdown_schema(cur):
+    global _GROWTH_SLOWDOWN_SCHEMA_READY
+    if _GROWTH_SLOWDOWN_SCHEMA_READY:
+        return
+    cur.execute(
+        "ALTER TABLE fitrah_users "
+        "ADD COLUMN IF NOT EXISTS growth_slowdown_until      DATE, "
+        "ADD COLUMN IF NOT EXISTS growth_slowdown_multiplier NUMERIC(3,2) DEFAULT 1.0"
+    )
+    _GROWTH_SLOWDOWN_SCHEMA_READY = True
+
+
+# Tunables for the growth-slowdown approach (review #3)
+GROWTH_SLOWDOWN_DAYS = 7
+GROWTH_SLOWDOWN_MULTIPLIER = 0.5
+
+
+def _fetch_growth_multiplier(cur, user_id: str) -> float:
+    """Return active growth-slowdown multiplier (1.0 if none / expired)."""
+    try:
+        cur.execute(
+            "SELECT growth_slowdown_until, growth_slowdown_multiplier "
+            "FROM fitrah_users WHERE user_id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    except Exception:
+        return 1.0
+    if not row:
+        return 1.0
+    until, mult = row
+    if until and mult is not None and until >= datetime.now(timezone.utc).date():
+        try:
+            return float(mult)
+        except Exception:
+            return 1.0
+    return 1.0
 
 
 @router.patch("/user/settings")
@@ -1252,12 +1524,25 @@ def patch_user_settings(body: UserSettingsRequest, jwt_payload: dict = Depends(v
         update_fields.append("quranic_mirror_muted = %s")
         update_vals.append(body.quranic_mirror_muted)
 
+    # Review #8 — trusted-contact fields (nullable / empty-string clears)
+    trusted_requested = (
+        body.trusted_contact_name is not None or body.trusted_contact_number is not None
+    )
+    if body.trusted_contact_name is not None:
+        update_fields.append("trusted_contact_name = %s")
+        update_vals.append(body.trusted_contact_name or None)
+    if body.trusted_contact_number is not None:
+        update_fields.append("trusted_contact_number = %s")
+        update_vals.append(body.trusted_contact_number or None)
+
     if not update_fields:
         raise HTTPException(400, "No settings provided to update.")
 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
+        if trusted_requested:
+            _ensure_trusted_contact_schema(cur)
         update_vals.append(user_id)
         cur.execute(
             f"UPDATE fitrah_users SET {', '.join(update_fields)} WHERE user_id = %s",
@@ -2008,68 +2293,50 @@ def log_penalty(body: PenaltyRequest, jwt_payload: dict = Depends(verify_token))
         if not cur.fetchone():
             raise HTTPException(404, f"User '{user_id}' not found. Call /user/setup first.")
 
-        # Fetch current dimension scores
+        # Review #3 — do NOT subtract earned points. Slips set a growth-slowdown
+        # window so future gains apply at a reduced multiplier for N days. The
+        # penalty is still logged for history/pattern analysis and the relapse
+        # resets tawbah_streak where applicable.
+        _ensure_growth_slowdown_schema(cur)
+
+        slowdown_until = datetime.now(timezone.utc).date() + timedelta(days=GROWTH_SLOWDOWN_DAYS)
+
+        # Fetch current dimension scores (unchanged) for response
         dim_scores = _fetch_dim_scores(cur, user_id)
-
-        # Apply deductions (floor at 0 for each dimension)
-        if dim_primary in dim_scores:
-            dim_scores[dim_primary] = max(0.0, dim_scores[dim_primary] + pts_primary)
-        if dim_secondary and dim_secondary in dim_scores:
-            dim_scores[dim_secondary] = max(0.0, dim_scores[dim_secondary] + pts_secondary)
-
         new_crystal = calculate_crystal_score(dim_scores)
         new_level   = get_nafs_level(new_crystal, dim_scores.get("taqwa", 0))
         progress    = get_nafs_progress_pct(new_crystal, new_level)
 
-        # Tawbah streak: if this is a tawbah-type relapse, reset the streak
         is_tawbah_related = "tawbah" in body.action_key.lower()
-        # Persist dimension scores
-        set_clauses = ", ".join(
-            f"{DIM_COLUMNS[d]} = %s" for d in VALID_DIMENSIONS
-        )
-        vals = [dim_scores[d] for d in VALID_DIMENSIONS]
 
         if is_tawbah_related:
             cur.execute(
-                f"""UPDATE fitrah_user_dimensions
-                    SET {set_clauses}, updated_at = now()
-                    WHERE user_id = %s""",
-                vals + [user_id],
-            )
-            cur.execute(
                 """UPDATE fitrah_users
-                   SET crystal_score = %s,
-                       current_nafs_level = %s,
-                       tawbah_streak_current = 0,
-                       last_active_at = now()
+                   SET growth_slowdown_until      = %s,
+                       growth_slowdown_multiplier = %s,
+                       tawbah_streak_current      = 0,
+                       last_active_at             = now()
                    WHERE user_id = %s""",
-                (new_crystal, new_level["level_key"], user_id),
+                (slowdown_until, GROWTH_SLOWDOWN_MULTIPLIER, user_id),
             )
         else:
             cur.execute(
-                f"""UPDATE fitrah_user_dimensions
-                    SET {set_clauses}, updated_at = now()
-                    WHERE user_id = %s""",
-                vals + [user_id],
-            )
-            cur.execute(
                 """UPDATE fitrah_users
-                   SET crystal_score = %s,
-                       current_nafs_level = %s,
-                       last_active_at = now()
+                   SET growth_slowdown_until      = %s,
+                       growth_slowdown_multiplier = %s,
+                       last_active_at             = now()
                    WHERE user_id = %s""",
-                (new_crystal, new_level["level_key"], user_id),
+                (slowdown_until, GROWTH_SLOWDOWN_MULTIPLIER, user_id),
             )
 
-        # Log the penalty in action_logs
+        # Log the event with 0 points — no deduction, pattern tracking only
         cur.execute(
             """INSERT INTO fitrah_user_action_logs
                (user_id, action_key, points_primary, dimension_primary,
                 points_secondary, dimension_secondary)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, 0, %s, 0, %s)""",
             (user_id, body.action_key,
-             pts_primary, dim_primary,
-             pts_secondary if dim_secondary else None,
+             dim_primary,
              dim_secondary),
         )
 
@@ -2078,8 +2345,16 @@ def log_penalty(body: PenaltyRequest, jwt_payload: dict = Depends(verify_token))
         response = {
             "action_key":    body.action_key,
             "action_name":   action.get("action_name", body.action_key),
-            "points_applied": {
-                dim_primary: pts_primary,
+            "growth_slowdown": {
+                "active":            True,
+                "multiplier":        GROWTH_SLOWDOWN_MULTIPLIER,
+                "until":             slowdown_until.isoformat(),
+                "days":              GROWTH_SLOWDOWN_DAYS,
+                "message_ur": (
+                    "Aapka kaam mita nahi — sirf agle "
+                    f"{GROWTH_SLOWDOWN_DAYS} din thoda halka rahega. "
+                    "Istiqamat wapas aati hai."
+                ),
             },
             "crystal_score": new_crystal,
             "nafs_level": {
@@ -2091,8 +2366,6 @@ def log_penalty(body: PenaltyRequest, jwt_payload: dict = Depends(verify_token))
             },
             "dimension_scores": {k: round(v, 1) for k, v in dim_scores.items()},
         }
-        if dim_secondary:
-            response["points_applied"][dim_secondary] = pts_secondary
         if is_tawbah_related:
             response["tawbah_streak_reset"] = True
 
@@ -2303,7 +2576,7 @@ def nafs_message(body: NafsMessageRequest, jwt_payload: dict = Depends(verify_to
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=_MAQSAD_CFG.get("max_tokens", 800),
             messages=[{"role": "user", "content": user_msg}],
-            system=system_prompt,
+            system=_fitrah_system(system_prompt),
         )
         raw = resp.content[0].text.strip()
         # Strip markdown code fences if present
@@ -2376,7 +2649,7 @@ def streak_break_message(body: StreakBreakRequest, jwt_payload: dict = Depends(v
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=_MAQSAD_CFG.get("max_tokens", 600),
             messages=[{"role": "user", "content": user_msg}],
-            system=system_prompt,
+            system=_fitrah_system(system_prompt),
         )
         raw = resp.content[0].text.strip()
         if raw.startswith("```"):
@@ -2538,7 +2811,7 @@ def maqsad_weekly_summary(user_id: Optional[str] = None, jwt_payload: dict = Dep
                 model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
                 max_tokens=300,
                 messages=[{"role": "user", "content": user_msg}],
-                system="Tum ek Islamic roohani guide ho. Sirf valid JSON return karo — no markdown.",
+                system=_fitrah_system("Tum ek Islamic roohani guide ho. Sirf valid JSON return karo — no markdown."),
             )
             raw = resp.content[0].text.strip()
             if raw.startswith("```"):
@@ -2767,6 +3040,55 @@ VALID_EMOTIONAL_STATES = frozenset(
     ["calm", "anxious", "happy", "sad", "angry", "grateful", "disconnected"]
 )
 
+# Review #5 — per-Qalb-state routing: gentle concrete actions + AI chat framing
+# so logging a state opens a contextual journey, not just a label.
+_QALB_SUGGESTED_ACTIONS: dict[str, list[dict]] = {
+    "hard_heart": [
+        {"key": "dhikr_100", "ur": "100 bar Astaghfirullah — dil dheema karta hai."},
+        {"key": "recite_short_surah", "ur": "Surah Ikhlas 3 bar — rahmat ka darwaza."},
+        {"key": "akhlaq_chat", "ur": "Akhlaq AI se baat karein — kya cheez dil sakht kar rahi hai?"},
+    ],
+    "soft_heart": [
+        {"key": "gratitude_log", "ur": "3 cheezein jo aaj rahmat lagi — likh lein."},
+        {"key": "dua_for_others", "ur": "Kisi aur ke liye ek dua."},
+    ],
+    "distracted": [
+        {"key": "wudu_reset", "ur": "Wudu karein — tawajjuh wapas aati hai."},
+        {"key": "breathe_5", "ur": "5 saans ginein — ek lamha sukoon ka."},
+        {"key": "akhlaq_chat", "ur": "Akhlaq AI ko batayein — kya zehen mein ghoom raha hai?"},
+    ],
+    "ghafil": [
+        {"key": "tiny_action", "ur": "Ek chhoti si naiki — 1 minute ka dhikr bhi kaafi."},
+        {"key": "akhlaq_chat", "ur": "Akhlaq AI se halki si baat — koi pressure nahi."},
+    ],
+    "present": [
+        {"key": "nafl_salah", "ur": "2 rakat nafl — iss haaziri ka shukr."},
+        {"key": "quran_verse", "ur": "Ek ayah padhein aur sochein."},
+    ],
+    "broken": [
+        {"key": "crisis_safe_space", "ur": "Yahan safe ho — koi judgement nahi."},
+        {"key": "akhlaq_chat", "ur": "Akhlaq AI se baat karein — jo share karna hai kar lein."},
+        {"key": "trusted_contact", "ur": "Kisi bharose walay insaan ko call/message karein."},
+    ],
+    "hopeful": [
+        {"key": "niyyah_note", "ur": "Agla chhota qadam likh lein — umeed ko action banayein."},
+    ],
+}
+
+# The system prompt the UI should pass to Akhlaq AI chat when the user clicks
+# "open_akhlaq_ai_chat". Keeps tone consistent with review #12/#13.
+def _akhlaq_chat_prompt(qalb_state: str, emotional_state: str | None) -> str:
+    base = (
+        "You are Akhlaq AI — a warm Muslim companion. Tone: narm, empathetic, Urdu-first, "
+        "no lectures, no guilt. Validate feelings first; offer at most ONE small Islamic "
+        "action when the moment invites it. Never claim to know ghayb. If the user sounds "
+        "in crisis, point to trusted human help, not app features."
+    )
+    return (
+        f"{base}\n\nCurrent Qalb state: {qalb_state}"
+        + (f"\nEmotional state: {emotional_state}" if emotional_state else "")
+    )
+
 
 class QalbLogRequest(BaseModel):
     user_id:         Optional[str] = None
@@ -2805,7 +3127,7 @@ def _pick_opening_line(qalb_state: str, last_line_id: str | None) -> dict:
 
 
 @router.post("/qalb/log")
-def log_qalb_state(body: QalbLogRequest, jwt_payload: dict = Depends(verify_token)):
+def log_qalb_state(body: QalbLogRequest, detailed: bool = False, jwt_payload: dict = Depends(verify_token)):
     """
     Log today's Qalb state (one of 7). Returns rotating AI opener for Akhlaq AI chat.
     - Upserts one record per user per day in fitrah_qalb_state_history.
@@ -2900,14 +3222,19 @@ def log_qalb_state(body: QalbLogRequest, jwt_payload: dict = Depends(verify_toke
             "consecutive_ghafil":    consecutive_ghafil,
             "points_awarded":        points_awarded,
             "action":                "open_akhlaq_ai_chat",
+            # Review #5 — contextual routing: actions the UI can render as chips + an
+            # Akhlaq chat system-prompt so the conversation starts warm and aligned.
+            "suggested_actions":     _QALB_SUGGESTED_ACTIONS.get(body.qalb_state, []),
+            "akhlaq_chat_prompt":    _akhlaq_chat_prompt(body.qalb_state, body.emotional_state),
         }
         if _is_crisis_situation("", body.qalb_state):
             resp["crisis_ayah"] = _crisis_ayah()
             resp["crisis_safe"] = True
+            resp["trusted_contact"] = _fetch_trusted_contact(user_id)
         elif body.qalb_state == "hopeful":
             # Serve an encouraging tazkiya/ihsan ayah to amplify the hopeful state
             resp["encouragement_ayah"] = _smart_ayah("tazkiya", "hopeful")
-        return resp
+        return _strip_numeric_if_hidden(resp, user_id, detailed)
     except HTTPException:
         conn.rollback()
         raise
@@ -2966,7 +3293,7 @@ class BattlefieldRequest(BaseModel):
 
 @router.post("/battlefield/analyze")
 @limiter.limit("10/minute")
-def battlefield_analyze(request: Request, body: BattlefieldRequest, jwt_payload: dict = Depends(verify_token)):
+def battlefield_analyze(request: Request, body: BattlefieldRequest, detailed: bool = False, jwt_payload: dict = Depends(verify_token)):
     """
     Nafs Battlefield Visualizer. AI identifies 4 forces from recent activity.
     Awards TAZKIYA +5 (nafs_battlefield_session).
@@ -2982,9 +3309,10 @@ def battlefield_analyze(request: Request, body: BattlefieldRequest, jwt_payload:
     if body.struggle_text and check_crisis(body.struggle_text):
         from fitrah_engine.fitrah_middleware import CRISIS_RESOURCE_TEXT
         return {
-            "user_id":        user_id,
-            "crisis":         True,
-            "crisis_message": CRISIS_RESOURCE_TEXT,
+            "user_id":         user_id,
+            "crisis":          True,
+            "crisis_message":  CRISIS_RESOURCE_TEXT,
+            "trusted_contact": _fetch_trusted_contact(user_id),
         }
 
     conn = get_db_connection()
@@ -3044,7 +3372,7 @@ def battlefield_analyze(request: Request, body: BattlefieldRequest, jwt_payload:
                 model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
                 max_tokens=900,
                 messages=[{"role": "user", "content": user_msg}],
-                system="You are an Islamic spiritual psychologist. Respond ONLY with valid JSON — no markdown.",
+                system=_fitrah_system("You are an Islamic spiritual psychologist. Respond ONLY with valid JSON — no markdown."),
             )
             raw = resp.content[0].text.strip()
             if raw.startswith("```"):
@@ -3091,14 +3419,23 @@ def battlefield_analyze(request: Request, body: BattlefieldRequest, jwt_payload:
                 )
                 intervention[_fld] = _safe
 
-        return {
+        # Review #6 — attach severity + optional trusted-human nudge
+        severity = _classify_severity(body.struggle_text or "")
+        resp = {
             "user_id":        user_id,
             "battle_summary": battle_summary,
             "forces":         ai_result.get("forces", {}),
             "intervention":   intervention,
             "points_awarded": {"tazkiya": 5},
             "crystal_score":  new_crystal,
+            "severity":       severity,
         }
+        nudge = _severity_nudge(severity)
+        if nudge:
+            if severity == "severe":
+                nudge["trusted_contact"] = _fetch_trusted_contact(user_id)
+            resp["severity_nudge"] = nudge
+        return _strip_numeric_if_hidden(resp, user_id, detailed)
     except HTTPException:
         conn.rollback()
         raise
@@ -3455,13 +3792,13 @@ def maqsad_drift_check(user_id: Optional[str] = None, jwt_payload: dict = Depend
             raise HTTPException(404, "User not found.")
         ummah_role, life_stage, archetype, drift_pause_until = row
 
-        # PDF §10 — user has acknowledged this as conscious_choice; pause detection
+        # PDF §10 — user has acknowledged this as conscious_choice or context override; pause detection
         if drift_pause_until and drift_pause_until >= datetime.now(timezone.utc).date():
             return {
                 "user_id":          uid,
                 "drift_detected":   False,
                 "paused_until":     drift_pause_until.isoformat(),
-                "message":          "Drift detection paused at your request. Resumes after pause period.",
+                "message":          "Abhi jaiza pause par hai — pause period ke baad dobara milenge. Apna safar jari rakhen.",
             }
         cur.execute(
             "SELECT action_key, dimension_primary, COUNT(*) FROM fitrah_user_action_logs WHERE user_id=%s AND logged_at >= now() - INTERVAL '14 days' AND points_primary>0 GROUP BY action_key, dimension_primary ORDER BY COUNT(*) DESC",
@@ -3470,7 +3807,7 @@ def maqsad_drift_check(user_id: Optional[str] = None, jwt_payload: dict = Depend
         recent = [{"action_key": r[0], "dimension": r[1], "count": r[2]} for r in cur.fetchall()]
         if not recent:
             return {"user_id": uid, "drift_detected": False,
-                    "message": "Koi activity nahi mili last 14 din mein — app use shuru karein."}
+                    "message": "Pichle 14 din mein koi activity record nahi hui — jab ready hon, halka sa start le lein."}
 
         top_actions = ", ".join(
             f"{r['action_key']}×{r['count']}" for r in recent[:5]
@@ -3487,7 +3824,7 @@ def maqsad_drift_check(user_id: Optional[str] = None, jwt_payload: dict = Depend
                 model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
                 max_tokens=600,
                 messages=[{"role": "user", "content": user_msg}],
-                system=_drift_sys,
+                system=_fitrah_system(_drift_sys),
             )
             raw = resp.content[0].text.strip()
             if raw.startswith("```"):
@@ -3498,9 +3835,16 @@ def maqsad_drift_check(user_id: Optional[str] = None, jwt_payload: dict = Depend
         except Exception:
             ai_result = {
                 "drift_detected": False,
-                "observation_ur": "Jaiza lene mein masla aaya — apna safar jari rakhen.",
+                "observation_ur": "Jaiza lene mein masla aaya — kuch dino baad dobara dekhte hain.",
                 "alignment_action_ur": None,
             }
+        # Review #4 — soften framing: this is a reflective check-in, not a red flag.
+        observation = ai_result.get("observation_ur")
+        if observation and ai_result.get("drift_detected"):
+            ai_result["reflection_prompt"] = (
+                "Yeh sirf ek halka sa jaiza hai — khud se poochein: kya yeh phase "
+                "aap ki current niyyah ke sath mel khata hai?"
+            )
         return {"user_id": uid, **ai_result}
     except HTTPException:
         raise
@@ -3515,10 +3859,17 @@ def maqsad_drift_check(user_id: Optional[str] = None, jwt_payload: dict = Depend
 # PDF §10 — the three user response options to a detected drift
 _DRIFT_RESPONSES = frozenset(["realign", "reassess", "conscious_choice"])
 
+# Review #4 — short-pause life contexts. Valid values trigger a 14-day soft pause
+# instead of the 30-day conscious_choice pause, so life-season gaps don't feel
+# like a permanent opt-out.
+_CONTEXT_OVERRIDES = frozenset(["busy", "health", "travel", "ramadan"])
+_CONTEXT_PAUSE_DAYS = 14
+
 
 class DriftAcknowledgeRequest(BaseModel):
-    user_id:  Optional[str] = None
-    response: str  # realign | reassess | conscious_choice
+    user_id:          Optional[str] = None
+    response:         str                         # realign | reassess | conscious_choice
+    context_override: Optional[str] = None        # busy | health | travel | ramadan
 
 
 @router.post("/maqsad/drift_acknowledge")
@@ -3539,6 +3890,8 @@ def maqsad_drift_acknowledge(
         raise HTTPException(403, "Access denied.")
     if body.response not in _DRIFT_RESPONSES:
         raise HTTPException(400, f"response must be one of: {sorted(_DRIFT_RESPONSES)}")
+    if body.context_override is not None and body.context_override not in _CONTEXT_OVERRIDES:
+        raise HTTPException(400, f"context_override must be one of: {sorted(_CONTEXT_OVERRIDES)}")
 
     conn = get_db_connection()
     try:
@@ -3548,8 +3901,18 @@ def maqsad_drift_acknowledge(
             raise HTTPException(404, "User not found.")
 
         pause_until = None
+        today = datetime.now(timezone.utc).date()
         if body.response == "conscious_choice":
-            pause_until = datetime.now(timezone.utc).date() + timedelta(days=30)
+            pause_until = today + timedelta(days=30)
+            cur.execute(
+                """UPDATE fitrah_users
+                   SET drift_pause_until = %s, purpose_drift_days = 0
+                   WHERE user_id = %s""",
+                (pause_until, uid),
+            )
+        elif body.context_override:
+            # Review #4 — short life-context pause (busy/health/travel/ramadan)
+            pause_until = today + timedelta(days=_CONTEXT_PAUSE_DAYS)
             cur.execute(
                 """UPDATE fitrah_users
                    SET drift_pause_until = %s, purpose_drift_days = 0
@@ -3583,16 +3946,24 @@ def maqsad_drift_acknowledge(
         conn.commit()
 
         messages = {
-            "realign":          "Wapas aana hi asli niyyah hai — alignment actions suggest ki ja rahi hain.",
-            "reassess":         "Thik hai — Nature Profiler dobara karke apna maqsad re-assess kar sakte hain.",
+            "realign":          "Wapas aana hi asli niyyah hai — kuch narmi se alignment actions suggest ki ja rahi hain.",
+            "reassess":         "Bilkul — Nature Profiler dobara karke apna maqsad tazah nazar se dekh sakte hain.",
             "conscious_choice": "Aapki choice respected — agle 30 din drift detection paused.",
         }
+        _CTX_MSG = {
+            "busy":    "Samajh aata hai — busy phase hai. Agle 14 din halka sa pause, phir dobara milte hain.",
+            "health":  "Sehat pehle. Agle 14 din pause — jab tayyar hon wapas chalein ge.",
+            "travel":  "Safar mubarak. 14 din ka pause laga diya — wapsi par dobara milenge.",
+            "ramadan": "Ramadan ka mahol alag hota hai — 14 din drift detection paused.",
+        }
+        msg = _CTX_MSG[body.context_override] if body.context_override else messages[body.response]
         return {
-            "user_id":        uid,
-            "response":       body.response,
-            "pause_until":    pause_until.isoformat() if pause_until else None,
-            "points_awarded": awarded,
-            "message":        messages[body.response],
+            "user_id":          uid,
+            "response":         body.response,
+            "context_override": body.context_override,
+            "pause_until":      pause_until.isoformat() if pause_until else None,
+            "points_awarded":   awarded,
+            "message":          msg,
         }
     except HTTPException:
         conn.rollback()
@@ -3714,7 +4085,7 @@ def maqsad_habit_simulate(body: HabitSimulateRequest, jwt_payload: dict = Depend
         resp = anthropic_client.messages.create(
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=700,
-            system=system_prompt,
+            system=_fitrah_system(system_prompt),
             messages=[{"role": "user", "content": user_msg}],
         )
         raw = resp.content[0].text.strip()
@@ -3965,10 +4336,11 @@ def qadr_engine(request: Request, body: QadrRequest, jwt_payload: dict = Depends
     if check_crisis(body.situation or ""):
         from fitrah_engine.fitrah_middleware import CRISIS_RESOURCE_TEXT
         return {
-            "user_id":        user_id,
-            "situation":      body.situation,
-            "crisis":         True,
-            "crisis_message": CRISIS_RESOURCE_TEXT,
+            "user_id":         user_id,
+            "situation":       body.situation,
+            "crisis":          True,
+            "crisis_message":  CRISIS_RESOURCE_TEXT,
+            "trusted_contact": _fetch_trusted_contact(user_id),
         }
 
     _qadr_tmpl = _PATCH_CALLS["qadr_engine"]["simple_prompt"]
@@ -3978,7 +4350,7 @@ def qadr_engine(request: Request, body: QadrRequest, jwt_payload: dict = Depends
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=700,
             messages=[{"role": "user", "content": user_msg}],
-            system=(
+            system=_fitrah_system(
                 "Tum ek Islamic scholar ho — Quran aur Seerah ka gehra ilm rakhte ho. "
                 "Tone compassionate ho — judgment bilkul nahi. "
                 "Sirf valid JSON return karo — no markdown, no extra text."
@@ -4022,6 +4394,9 @@ def qadr_engine(request: Request, body: QadrRequest, jwt_payload: dict = Depends
     finally:
         release_db_connection(conn)
 
+    # Review #7 — soften harsh labels before middleware / return
+    result = _soften_classification(result)
+
     # Apply Layer 6 (qadr claim filter) + Safety Check C (comparison filter) to free-form fields
     for _fld in ("explanation_ur", "action_ur"):
         if result.get(_fld):
@@ -4058,10 +4433,11 @@ def life_test_classifier(request: Request, body: LifeTestRequest, jwt_payload: d
     if check_crisis(body.problem or ""):
         from fitrah_engine.fitrah_middleware import CRISIS_RESOURCE_TEXT
         return {
-            "user_id":        user_id,
-            "problem":        body.problem,
-            "crisis":         True,
-            "crisis_message": CRISIS_RESOURCE_TEXT,
+            "user_id":         user_id,
+            "problem":         body.problem,
+            "crisis":          True,
+            "crisis_message":  CRISIS_RESOURCE_TEXT,
+            "trusted_contact": _fetch_trusted_contact(user_id),
         }
 
     conn = get_db_connection()
@@ -4095,7 +4471,7 @@ def life_test_classifier(request: Request, body: LifeTestRequest, jwt_payload: d
             model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
             max_tokens=600,
             messages=[{"role": "user", "content": user_msg}],
-            system=_lt_sys,
+            system=_fitrah_system(_lt_sys),
         )
         raw = resp.content[0].text.strip()
         if raw.startswith("```"):
@@ -4134,10 +4510,22 @@ def life_test_classifier(request: Request, body: LifeTestRequest, jwt_payload: d
     finally:
         release_db_connection(conn)
 
+    # Review #7 — soften harsh labels before middleware / return
+    result = _soften_classification(result)
+
     for _fld in ("explanation_ur", "sabr_action_ur"):
         if result.get(_fld):
             _safe, _ = _run_middleware(user_id, result[_fld], last_user_message=body.problem or "", action_key="life_test_classified")
             result[_fld] = _safe
+
+    # Review #6 — attach severity + optional trusted-human nudge
+    severity = _classify_severity(body.problem)
+    result["severity"] = severity
+    nudge = _severity_nudge(severity)
+    if nudge:
+        if severity == "severe":
+            nudge["trusted_contact"] = _fetch_trusted_contact(user_id)
+        result["severity_nudge"] = nudge
 
     return {"user_id": user_id, "problem": body.problem, **result}
 
@@ -4200,7 +4588,7 @@ def sunnah_dna_refresh(user_id: Optional[str] = None, jwt_payload: dict = Depend
                 model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
                 max_tokens=400,
                 messages=[{"role": "user", "content": user_msg}],
-                system=_sys,
+                system=_fitrah_system(_sys),
             )
             raw = resp.content[0].text.strip()
             if raw.startswith("```"):
@@ -4557,6 +4945,7 @@ def get_weekly_ihtisab(user_id: Optional[str] = None, jwt_payload: dict = Depend
                     model=_MAQSAD_CFG.get("model", "claude-sonnet-4-6"),
                     max_tokens=300,
                     messages=[{"role": "user", "content": prompt}],
+                    system=_fitrah_system(None),
                 )
                 narrative = ai_r.content[0].text.strip()
             except Exception as exc:
@@ -4897,3 +5286,136 @@ def kafarat_ask(body: KafaratAskRequest, jwt_payload: dict = Depends(verify_toke
     if static:
         return {**static, "rag_used": False, "rag_context_available": True}
     raise HTTPException(503, "Kafarat ruling unavailable. Please try again.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Review #10 — Feature flag system for phased rollouts.
+# Table is auto-provisioned on first use so no separate migration is required.
+# Admin endpoints are guarded by the FITRAH_ADMIN_TOKEN env var.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_FLAGS_SCHEMA_READY = False
+_FLAGS_CACHE: dict[str, tuple[bool, float]] = {}   # key → (enabled, epoch_loaded_at)
+_FLAGS_CACHE_TTL_SEC = 60
+
+
+def _ensure_feature_flags_schema(cur):
+    global _FLAGS_SCHEMA_READY
+    if _FLAGS_SCHEMA_READY:
+        return
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS fitrah_feature_flags (
+               flag_key     TEXT PRIMARY KEY,
+               enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+               description  TEXT,
+               updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+           )"""
+    )
+    _FLAGS_SCHEMA_READY = True
+
+
+def is_feature_enabled(flag_key: str, default: bool = False) -> bool:
+    """
+    Return whether a feature flag is enabled. Caches reads per-process for 60s.
+    Missing flags return `default`.
+    """
+    import time
+    now = time.time()
+    cached = _FLAGS_CACHE.get(flag_key)
+    if cached and now - cached[1] < _FLAGS_CACHE_TTL_SEC:
+        return cached[0]
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        _ensure_feature_flags_schema(cur)
+        cur.execute(
+            "SELECT enabled FROM fitrah_feature_flags WHERE flag_key = %s",
+            (flag_key,),
+        )
+        row = cur.fetchone()
+        enabled = bool(row[0]) if row else default
+        _FLAGS_CACHE[flag_key] = (enabled, now)
+        return enabled
+    except Exception:
+        return default
+    finally:
+        release_db_connection(conn)
+
+
+def _require_admin(request: Request):
+    """Guard: require X-Admin-Token header to match env var FITRAH_ADMIN_TOKEN."""
+    expected = os.getenv("FITRAH_ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(503, "Admin endpoints disabled (FITRAH_ADMIN_TOKEN not set).")
+    provided = request.headers.get("x-admin-token") or request.headers.get("X-Admin-Token")
+    if provided != expected:
+        raise HTTPException(403, "Admin token required.")
+
+
+class FeatureFlagUpsertRequest(BaseModel):
+    enabled:     bool
+    description: Optional[str] = Field(None, max_length=300)
+
+
+@router.get("/admin/feature_flags")
+def list_feature_flags(request: Request):
+    """Admin — list every feature flag + state."""
+    _require_admin(request)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        _ensure_feature_flags_schema(cur)
+        cur.execute(
+            "SELECT flag_key, enabled, description, updated_at "
+            "FROM fitrah_feature_flags ORDER BY flag_key"
+        )
+        rows = cur.fetchall()
+        return {
+            "flags": [
+                {
+                    "flag_key":   r[0],
+                    "enabled":    bool(r[1]),
+                    "description": r[2],
+                    "updated_at": r[3].isoformat() if r[3] else None,
+                }
+                for r in rows
+            ],
+        }
+    except Exception:
+        log.exception("fitrah_routes feature flags list error")
+        raise HTTPException(500, "Internal server error.")
+    finally:
+        release_db_connection(conn)
+
+
+@router.patch("/admin/feature_flags/{flag_key}")
+def upsert_feature_flag(flag_key: str, body: FeatureFlagUpsertRequest, request: Request):
+    """Admin — create or toggle a feature flag. Clears in-process cache."""
+    _require_admin(request)
+    if not flag_key or len(flag_key) > 100:
+        raise HTTPException(400, "Invalid flag_key.")
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        _ensure_feature_flags_schema(cur)
+        cur.execute(
+            """INSERT INTO fitrah_feature_flags (flag_key, enabled, description, updated_at)
+               VALUES (%s, %s, %s, now())
+               ON CONFLICT (flag_key) DO UPDATE SET
+                   enabled     = EXCLUDED.enabled,
+                   description = COALESCE(EXCLUDED.description, fitrah_feature_flags.description),
+                   updated_at  = now()""",
+            (flag_key, body.enabled, body.description),
+        )
+        conn.commit()
+        _FLAGS_CACHE.pop(flag_key, None)
+        return {"flag_key": flag_key, "enabled": body.enabled}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("fitrah_routes feature flag upsert error")
+        raise HTTPException(500, "Internal server error.")
+    finally:
+        release_db_connection(conn)

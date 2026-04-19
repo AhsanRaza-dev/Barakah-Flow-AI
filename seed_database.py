@@ -634,13 +634,430 @@ CREATE INDEX IF NOT EXISTS idx_dua_pending_old
 """
 
 
+# ============================================================
+# TAWBAH OS — DDL (additive; zero impact on fitrah_* or pgvector)
+# ============================================================
+
+TAWBAH_TABLES_SQL = """
+-- ============================================================
+-- TAWBAH OS — MASTER CONFIG STORAGE  (seeded from JSON)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_system_configs (
+    config_key  TEXT        PRIMARY KEY,
+    data        JSONB       NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- TAWBAH OS — USER PROFILE & ONBOARDING
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_user_profile (
+    user_id             TEXT        PRIMARY KEY,
+    fiqh_school         TEXT        NOT NULL DEFAULT 'hanafi'
+                                    CHECK (fiqh_school IN ('hanafi','shafi','maliki','hanbali','ahle_hadith')),
+    tone_preference     TEXT        NOT NULL DEFAULT 'urdu_english_mix'
+                                    CHECK (tone_preference IN ('urdu_english_mix','urdu_formal','english_formal','hindi_english_mix','arabic_emphasized')),
+    country_code        TEXT,
+    tier_preference     TEXT        CHECK (tier_preference IN ('light','medium','severe')),
+    onboarded_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS tawbah_onboarding_state (
+    user_id             TEXT        PRIMARY KEY,
+    current_screen      INTEGER     NOT NULL DEFAULT 1,
+    profile_snapshot    JSONB,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at        TIMESTAMPTZ
+);
+
+-- ============================================================
+-- TAWBAH OS — SESSION STATE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_sessions (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    state           TEXT        NOT NULL DEFAULT 'NEW_SESSION'
+                                CHECK (state IN ('NEW_SESSION','TIER_DETECTED','GOAL_SELECTED','ENGINES_ACTIVE','COMPLETED','ABANDONED')),
+    tier            TEXT        CHECK (tier IN ('light','medium','severe')),
+    goal_type       TEXT,
+    entry_type      TEXT        NOT NULL DEFAULT 'normal',
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_sessions_user
+    ON tawbah_sessions (user_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_sessions_state
+    ON tawbah_sessions (state);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 0 (MUHASABA)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_daily_muhasaba_log (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    q1_answer_enc   BYTEA,
+    q2_answer_enc   BYTEA,
+    q3_answer_enc   BYTEA,
+    q4_answer_enc   BYTEA,
+    logged_date     DATE        NOT NULL,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_daily_muhasaba_user
+    ON tawbah_daily_muhasaba_log (user_id, logged_date DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_weekly_muhasaba_deep_log (
+    id                      SERIAL      PRIMARY KEY,
+    user_id                 TEXT        NOT NULL,
+    zuban_reflection_enc    BYTEA,
+    nafs_reflection_enc     BYTEA,
+    qalb_reflection_enc     BYTEA,
+    amal_reflection_enc     BYTEA,
+    week_ending             DATE        NOT NULL,
+    logged_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_weekly_muhasaba_user
+    ON tawbah_weekly_muhasaba_deep_log (user_id, week_ending DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_sin_pattern_observations (
+    id                      SERIAL      PRIMARY KEY,
+    user_id                 TEXT        NOT NULL,
+    pattern_type            TEXT        NOT NULL,
+    signal_count            INTEGER     NOT NULL DEFAULT 0,
+    pattern_description     TEXT,
+    first_detected          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_updated            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_sin_patterns_user
+    ON tawbah_sin_pattern_observations (user_id, last_updated DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_heart_disease_handoffs (
+    id                      SERIAL      PRIMARY KEY,
+    user_id                 TEXT        NOT NULL,
+    disease_detected        TEXT        NOT NULL,
+    signals_count           INTEGER     NOT NULL DEFAULT 0,
+    handoff_offered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_response           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_heart_disease_user
+    ON tawbah_heart_disease_handoffs (user_id, handoff_offered_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 1 (AQAL vs NAFS NEGOTIATION)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_aqal_nafs_logs (
+    id              SERIAL      PRIMARY KEY,
+    session_id      INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    user_id         TEXT        NOT NULL,
+    urge_text_enc   BYTEA,
+    nafs_voice_enc  BYTEA,
+    aqal_voice_enc  BYTEA,
+    resolution      TEXT,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_aqal_nafs_user
+    ON tawbah_aqal_nafs_logs (user_id, logged_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 2 (TAWBAH ROADMAP)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_roadmap (
+    id                          SERIAL      PRIMARY KEY,
+    session_id                  INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    user_id                     TEXT        NOT NULL,
+    gunah_description_enc       BYTEA,
+    requires_huquq              BOOLEAN     NOT NULL DEFAULT FALSE,
+    current_step                TEXT        NOT NULL DEFAULT 'imsak'
+                                            CHECK (current_step IN ('imsak','nadim','azm','huquq_ul_ibaad')),
+    status                      TEXT        NOT NULL DEFAULT 'in_progress'
+                                            CHECK (status IN ('in_progress','completed','abandoned')),
+    started_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at                TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_roadmap_user
+    ON tawbah_roadmap (user_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_roadmap_steps (
+    id              SERIAL      PRIMARY KEY,
+    roadmap_id      INTEGER     NOT NULL REFERENCES tawbah_roadmap(id) ON DELETE CASCADE,
+    user_id         TEXT        NOT NULL,
+    step            TEXT        NOT NULL
+                                CHECK (step IN ('imsak','nadim','azm','huquq_ul_ibaad')),
+    reflection_enc  BYTEA,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_roadmap_steps_roadmap
+    ON tawbah_roadmap_steps (roadmap_id, logged_at);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 3 (HABIT BREAKING)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_shaytan_patterns (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    trigger_time    TEXT,
+    location_enc    BYTEA,
+    emotion_enc     BYTEA,
+    gunah_category  TEXT,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_shaytan_user
+    ON tawbah_shaytan_patterns (user_id, logged_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_shaytan_time
+    ON tawbah_shaytan_patterns (user_id, trigger_time);
+
+CREATE TABLE IF NOT EXISTS tawbah_relapse_log (
+    id                          SERIAL      PRIMARY KEY,
+    session_id                  INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    user_id                     TEXT        NOT NULL,
+    context_enc                 BYTEA,
+    minutes_before_predicted    INTEGER,
+    logged_at                   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_relapse_user
+    ON tawbah_relapse_log (user_id, logged_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 4 (ISTIQAMAH + RUHANI FATIGUE)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_istiqamah_chapters (
+    user_id                 TEXT        NOT NULL,
+    chapter_id              TEXT        NOT NULL,
+    streak_start_date       DATE,
+    current_day_count       INTEGER     NOT NULL DEFAULT 0,
+    last_active_date        DATE,
+    max_streak_achieved     INTEGER     NOT NULL DEFAULT 0,
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, chapter_id)
+);
+
+CREATE TABLE IF NOT EXISTS tawbah_ruhani_fatigue_detections (
+    id                  SERIAL      PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    signals_active      TEXT[],
+    composite_weight    REAL,
+    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_ruhani_fatigue_user
+    ON tawbah_ruhani_fatigue_detections (user_id, detected_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 5 (SPIRITUAL RESURRECTION / TAHAJJUD)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_tahajjud_sessions (
+    id              SERIAL      PRIMARY KEY,
+    session_id      INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    user_id         TEXT        NOT NULL,
+    current_step    TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_tahajjud_user
+    ON tawbah_tahajjud_sessions (user_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_tahajjud_step_logs (
+    id              SERIAL      PRIMARY KEY,
+    tahajjud_id     INTEGER     NOT NULL REFERENCES tawbah_tahajjud_sessions(id) ON DELETE CASCADE,
+    user_id         TEXT        NOT NULL,
+    step            TEXT        NOT NULL,
+    reflection_enc  BYTEA,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_tahajjud_steps_session
+    ON tawbah_tahajjud_step_logs (tahajjud_id, logged_at);
+
+-- ============================================================
+-- TAWBAH OS — ENGINE 6 (KAFFARAT-UL-DHUNUB)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_kaffarah_activation (
+    id                              SERIAL      PRIMARY KEY,
+    session_id                      INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    user_id                         TEXT        NOT NULL,
+    activated_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    duration_days                   INTEGER     NOT NULL
+                                                CHECK (duration_days IN (30, 60, 90)),
+    target_gunah_optional_enc       BYTEA,
+    status                          TEXT        NOT NULL DEFAULT 'active'
+                                                CHECK (status IN ('active','completed','abandoned'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_kaffarah_user
+    ON tawbah_kaffarah_activation (user_id, activated_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_istighfar_log (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    count           INTEGER     NOT NULL DEFAULT 0,
+    type            TEXT        NOT NULL DEFAULT 'basic'
+                                CHECK (type IN ('basic','sayyid_morning','sayyid_evening')),
+    logged_date     DATE        NOT NULL,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_istighfar_user_date
+    ON tawbah_istighfar_log (user_id, logged_date DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_sadaqah_kaffarah_log (
+    id                  SERIAL      PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    amount_enc          BYTEA,
+    currency            TEXT        NOT NULL DEFAULT 'PKR',
+    recipient_type      TEXT,
+    niyyah_enc          BYTEA,
+    linked_gunah_enc    BYTEA,
+    is_jariyah          BOOLEAN     NOT NULL DEFAULT FALSE,
+    logged_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_sadaqah_user
+    ON tawbah_sadaqah_kaffarah_log (user_id, logged_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_hasanat_log (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    category        TEXT        NOT NULL,
+    description_enc BYTEA,
+    niyyah_enc      BYTEA,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_hasanat_user
+    ON tawbah_hasanat_log (user_id, logged_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_musibat_sabr_log (
+    id                  SERIAL      PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    category            TEXT        NOT NULL,
+    sensitivity_level   TEXT,
+    reflection_enc      BYTEA,
+    logged_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_musibat_user
+    ON tawbah_musibat_sabr_log (user_id, logged_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_dua_for_others_log (
+    id                          SERIAL      PRIMARY KEY,
+    user_id                     TEXT        NOT NULL,
+    mode                        TEXT        NOT NULL
+                                            CHECK (mode IN ('specific_person','general_ummah','specific_group')),
+    target_encrypted_optional   BYTEA,
+    logged_date                 DATE        NOT NULL,
+    logged_at                   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_dua_others_user
+    ON tawbah_dua_for_others_log (user_id, logged_date DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_hajj_umrah_intentions (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    type            TEXT        NOT NULL
+                                CHECK (type IN ('hajj_planned','hajj_completed','umrah_planned','umrah_completed')),
+    status          TEXT        NOT NULL DEFAULT 'logged',
+    year_target     INTEGER,
+    niyyah_enc      BYTEA,
+    reflection_enc  BYTEA,
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_hajj_umrah_user
+    ON tawbah_hajj_umrah_intentions (user_id, logged_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — DISPLAY / AUDIT LOGS
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_helpline_display_log (
+    id                  SERIAL      PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    country_code        TEXT,
+    helpline_type       TEXT,
+    trigger_context     TEXT,
+    displayed_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_helpline_user
+    ON tawbah_helpline_display_log (user_id, displayed_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_sacred_line_display_log (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    line_id         TEXT        NOT NULL,
+    context         TEXT,
+    displayed_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_sacred_line_user
+    ON tawbah_sacred_line_display_log (user_id, displayed_at DESC);
+
+-- ============================================================
+-- TAWBAH OS — CRISIS / EXIT PATHWAY LOGS
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tawbah_crisis_detections (
+    id                  SERIAL      PRIMARY KEY,
+    user_id             TEXT        NOT NULL,
+    session_id          INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    trigger_phrase_hash TEXT,
+    response_offered    TEXT,
+    detected_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_crisis_user
+    ON tawbah_crisis_detections (user_id, detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS tawbah_exit_pathways (
+    id              SERIAL      PRIMARY KEY,
+    user_id         TEXT        NOT NULL,
+    session_id      INTEGER     REFERENCES tawbah_sessions(id) ON DELETE SET NULL,
+    exit_type       TEXT        NOT NULL
+                                CHECK (exit_type IN ('completed','abandoned','paused','mufti_handoff','tibb_handoff','mental_health_bridge')),
+    notes           TEXT,
+    exited_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tawbah_exit_user
+    ON tawbah_exit_pathways (user_id, exited_at DESC);
+"""
+
+
 def run_ddl(cur) -> None:
     print("📋 Creating Fitrah tables (IF NOT EXISTS)…")
     cur.execute(CREATE_TABLES_SQL)
-    print("   ✅ Tables ready.")
-    print("📋 Running migrations…")
+    print("   ✅ Fitrah tables ready.")
+    print("📋 Running Fitrah migrations…")
     cur.execute(MIGRATE_SQL)
-    print("   ✅ Migrations applied.")
+    print("   ✅ Fitrah migrations applied.")
+    print("📋 Creating Tawbah OS tables (IF NOT EXISTS)…")
+    cur.execute(TAWBAH_TABLES_SQL)
+    print("   ✅ Tawbah OS tables ready.")
 
 
 # ── Master actions seeder ─────────────────────────────────────────────────────
@@ -771,6 +1188,76 @@ def seed_system_configs(cur) -> None:
         print(f"   ✅ '{key}' stored in fitrah_system_configs.")
 
 
+# ── Tawbah OS config seeder ───────────────────────────────────────────────────
+
+TAWBAH_DATA_DIR = os.path.join(os.path.dirname(__file__), "tawbah_os", "data")
+
+# Map config_key → source filename (some shared files live in fitrah_engine/data)
+_TAWBAH_CONFIGS = {
+    "onboarding_screens":            ("tawbah", "onboarding_screens.json"),
+    "tier_detection_rules":          ("tawbah", "tier_detection_rules.json"),
+    "engine_tier_allowance":         ("tawbah", "engine_tier_allowance.json"),
+    "tawbah_actions_config":         ("tawbah", "tawbah_actions_config.json"),
+    "muhasaba_engine_config":        ("tawbah", "muhasaba_engine_config.json"),
+    "weekly_muhasaba_questions":     ("tawbah", "weekly_muhasaba_questions.json"),
+    "kaffarah_engine_config":        ("tawbah", "kaffarah_engine_config.json"),
+    "aqal_nafs_negotiation_config":  ("tawbah", "aqal_nafs_negotiation_config.json"),
+    "bad_habits_subtypes":           ("tawbah", "bad_habits_subtypes.json"),
+    "internal_dialogue_corrections": ("tawbah", "internal_dialogue_corrections.json"),
+    "islamic_replacements":          ("tawbah", "islamic_replacements.json"),
+    "relapse_prediction_config":     ("tawbah", "relapse_prediction_config.json"),
+    "ruhani_fatigue_signals":        ("tawbah", "ruhani_fatigue_signals.json"),
+    "streak_milestones":             ("tawbah", "streak_milestones.json"),
+    "tawbah_nishaniyaan":            ("tawbah", "tawbah_nishaniyaan.json"),
+    "sacred_lines_rotation":         ("tawbah", "sacred_lines_rotation.json"),
+    "qabooliyat_times_config":       ("tawbah", "qabooliyat_times_config.json"),
+    "tier3_mufti_referral_cases":    ("tawbah", "tier3_mufti_referral_cases.json"),
+    "helplines_by_country":          ("tawbah", "helplines_by_country.json"),
+    "crisis_detection_patterns":     ("tawbah", "crisis_detection_patterns.json"),
+    "mental_health_bridge_config":   ("tawbah", "mental_health_bridge_config.json"),
+    "exit_pathways_config":          ("tawbah", "exit_pathways_config.json"),
+    "external_feature_links":        ("tawbah", "external_feature_links.json"),
+    # Shared files — prefer fitrah copy if present, else fall back to tawbah copy
+    "crisis_safe_ayaat":             ("shared", "crisis_safe_ayaat.json"),
+    "qalb_state_opening_lines":      ("shared", "qalb_state_opening_lines.json"),
+    "fiqh_rulings_kafarat":          ("shared", "fiqh_rulings_kafarat.json"),
+}
+
+
+def _load_tawbah_json(location: str, filename: str):
+    if location == "shared":
+        fitrah_path = os.path.join(DATA_DIR, filename)
+        tawbah_path = os.path.join(TAWBAH_DATA_DIR, filename)
+        path = fitrah_path if os.path.exists(fitrah_path) else tawbah_path
+    else:
+        path = os.path.join(TAWBAH_DATA_DIR, filename)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def seed_tawbah_configs(cur) -> int:
+    count = 0
+    skipped = []
+    for key, (location, filename) in _TAWBAH_CONFIGS.items():
+        try:
+            data = _load_tawbah_json(location, filename)
+        except FileNotFoundError:
+            skipped.append(filename)
+            continue
+        cur.execute(
+            """INSERT INTO tawbah_system_configs (config_key, data)
+               VALUES (%s, %s)
+               ON CONFLICT (config_key) DO UPDATE
+               SET data = EXCLUDED.data, updated_at = now()""",
+            (key, json.dumps(data, ensure_ascii=False)),
+        )
+        count += 1
+        print(f"   ✅ '{key}' stored in tawbah_system_configs.")
+    if skipped:
+        print(f"   ⚠️  Skipped (file not found): {', '.join(skipped)}")
+    return count
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -791,9 +1278,12 @@ def main() -> None:
         print("\n📦 Seeding master data…")
         seed_actions(cur)
         seed_system_configs(cur)
+        print("\n📦 Seeding Tawbah OS configs…")
+        tcount = seed_tawbah_configs(cur)
+        print(f"   ✅ {tcount} Tawbah configs stored.")
         conn.commit()
 
-        print("\n✅ All done! Fitrah database is ready.")
+        print("\n✅ All done! Fitrah + Tawbah OS database is ready.")
         print("\nNext steps:")
         print("  1. Add ANTHROPIC_API_KEY to your .env file")
         print("  2. Start the server: uvicorn main:app --reload --port 8000")

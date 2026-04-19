@@ -23,9 +23,10 @@ from rag_engine.app.main import app  # noqa: E402  (must be first FastAPI import
 from fitrah_engine.fitrah_routes import router as fitrah_router  # noqa: E402
 
 app.title   = "Barakah AI Enterprise"
-app.version = "5.0 — RAG + Fitrah"
+app.version = "6.0 — RAG + Fitrah + Tawbah OS"
 app.description = (
-    "Barakah AI — Islamic Fiqh RAG engine combined with Fitrah AI gamification."
+    "Barakah AI — Islamic Fiqh RAG engine combined with Fitrah AI gamification "
+    "and Tawbah OS (Nafs Rehabilitation System)."
 )
 
 app.include_router(
@@ -34,10 +35,24 @@ app.include_router(
     tags=["Fitrah Gamification Engine"],
 )
 
-# ── 3. Start the nightly decay background scheduler ──────────────────────────
-from fitrah_engine.scheduler import start_scheduler  # noqa: E402
+# ── 3. Mount the Tawbah OS router ────────────────────────────────────────────
+from tawbah_os.tawbah_routes import router as tawbah_router  # noqa: E402
 
-start_scheduler()
+app.include_router(
+    tawbah_router,
+    prefix="/api/tawbah",
+    tags=["Tawbah OS — Nafs Rehabilitation"],
+)
+
+# ── 4. Start the nightly decay background scheduler ──────────────────────────
+from fitrah_engine.scheduler import start_scheduler as start_fitrah_scheduler  # noqa: E402
+from tawbah_os.scheduler import start_scheduler as start_tawbah_scheduler  # noqa: E402
+
+start_fitrah_scheduler()
+start_tawbah_scheduler()
 
 logging.getLogger("fitrah").setLevel(logging.INFO)
-logging.info("✅ Barakah AI Enterprise started — RAG + Fitrah engines active.")
+logging.getLogger("tawbah_os").setLevel(logging.INFO)
+logging.info(
+    "✅ Barakah AI Enterprise started — RAG + Fitrah + Tawbah OS active."
+)

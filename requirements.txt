@@ -14,3 +14,5 @@ supabase>=2.4.0
 # ── Fitrah AI additions ───────────────────────────────────────────────────────
 anthropic>=0.40.0
 APScheduler>=3.10.4
+# ── Tawbah OS additions ───────────────────────────────────────────────────────
+cryptography>=42.0.0
